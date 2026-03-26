@@ -1,0 +1,62 @@
+{
+  "model_dir": "PDHModel",
+  "data_root": "QCarDataSet",
+  "plot_limit": 500,
+  "evaluation_type": "closed_loop",
+  "directions": {
+    "forward": {
+      "direction": "forward",
+      "num_closed_loop_episodes": 519,
+      "num_rollout_steps": 22493,
+      "seq_length": 10,
+      "comparison_csv": "PDH_test_plots_closed_loop\\forward_closed_loop_evaluation\\forward_closed_loop_comparison.csv",
+      "combined_plot": "PDH_test_plots_closed_loop\\forward_closed_loop_evaluation\\forward_closed_loop_combined_7d_plot.svg",
+      "yaw_plot": "PDH_test_plots_closed_loop\\forward_closed_loop_evaluation\\forward_closed_loop_yaw_plot.svg",
+      "mae_by_dim": {
+        "pos_x": 1.8162624835968018,
+        "pos_y": 0.043843694031238556,
+        "pos_z": 1.4685693979263306,
+        "rot_0": 0.2281889170408249,
+        "rot_1": 0.2949357330799103,
+        "rot_2": 0.26093244552612305,
+        "rot_3": 0.29323717951774597
+      },
+      "rmse_by_dim": {
+        "pos_x": 2.982943058013916,
+        "pos_y": 0.07305014878511429,
+        "pos_z": 2.2537028789520264,
+        "rot_0": 0.3574589490890503,
+        "rot_1": 0.45046764612197876,
+        "rot_2": 0.3981115221977234,
+        "rot_3": 0.44179850816726685
+      }
+    },
+    "backward": {
+      "direction": "backward",
+      "num_closed_loop_episodes": 41,
+      "num_rollout_steps": 17259,
+      "seq_length": 10,
+      "comparison_csv": "PDH_test_plots_closed_loop\\backward_closed_loop_evaluation\\backward_closed_loop_comparison.csv",
+      "combined_plot": "PDH_test_plots_closed_loop\\backward_closed_loop_evaluation\\backward_closed_loop_combined_7d_plot.svg",
+      "yaw_plot": "PDH_test_plots_closed_loop\\backward_closed_loop_evaluation\\backward_closed_loop_yaw_plot.svg",
+      "mae_by_dim": {
+        "pos_x": 4.145740985870361,
+        "pos_y": 0.1926213949918747,
+        "pos_z": 2.1618263721466064,
+        "rot_0": 0.3825644850730896,
+        "rot_1": 0.4689105153083801,
+        "rot_2": 0.4688733220100403,
+        "rot_3": 0.4218544065952301
+      },
+      "rmse_by_dim": {
+        "pos_x": 7.416896820068359,
+        "pos_y": 0.29268380999565125,
+        "pos_z": 3.2354938983917236,
+        "rot_0": 0.4457143247127533,
+        "rot_1": 0.5652728080749512,
+        "rot_2": 0.5425755381584167,
+        "rot_3": 0.5137072801589966
+      }
+    }
+  }
+}

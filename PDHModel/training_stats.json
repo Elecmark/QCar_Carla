@@ -1,0 +1,34 @@
+{
+  "config": {
+    "data_root": "QCarDataSet",
+    "output_dir": "PDHModel",
+    "seq_length": 10,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "epochs": 0,
+    "train_ratio": 0.8,
+    "hidden_dim": 256,
+    "num_layers": 3,
+    "device": "cpu",
+    "gradient_clip_max_norm": 1.0,
+    "num_threads": 32,
+    "print_every": 1,
+    "label_source": "linear_speed_sign_yaw_delta_relative_pose_xzyw_v5",
+    "dataset_dirs": [
+      "linefollow_constant",
+      "linefollow_quadratic",
+      "linefollow_sin",
+      "linefollow_squareroot",
+      "linefollow_triangle",
+      "manual_clockwise_forward",
+      "manual_counter_forward",
+      "manual_clockwise_backward",
+      "manual_counter_backward",
+      "openloop_constant",
+      "openloop_quadratic",
+      "openloop_sin",
+      "openloop_squareroot",
+      "openloop_triangle"
+    ]
+  }
+}

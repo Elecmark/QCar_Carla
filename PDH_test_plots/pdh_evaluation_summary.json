@@ -1,0 +1,59 @@
+{
+  "model_dir": "PDHModel",
+  "data_root": "QCarDataSet",
+  "plot_limit": 500,
+  "directions": {
+    "forward": {
+      "direction": "forward",
+      "num_test_samples": 22493,
+      "seq_length": 10,
+      "comparison_csv": "PDH_test_plots\\forward_evaluation\\forward_comparison.csv",
+      "combined_plot": "PDH_test_plots\\forward_evaluation\\forward_combined_7d_plot.svg",
+      "yaw_plot": "PDH_test_plots\\forward_evaluation\\forward_yaw_plot.svg",
+      "mae_by_dim": {
+        "pos_x": 0.01098923571407795,
+        "pos_y": 0.0008404239779338241,
+        "pos_z": 0.028140224516391754,
+        "rot_0": 0.0018089988734573126,
+        "rot_1": 0.005286609288305044,
+        "rot_2": 0.0017948467284440994,
+        "rot_3": 0.005406063515692949
+      },
+      "rmse_by_dim": {
+        "pos_x": 0.024572934955358505,
+        "pos_y": 0.0015531362732872367,
+        "pos_z": 0.038915980607271194,
+        "rot_0": 0.002879008650779724,
+        "rot_1": 0.012463705614209175,
+        "rot_2": 0.0027040489949285984,
+        "rot_3": 0.010491915978491306
+      }
+    },
+    "backward": {
+      "direction": "backward",
+      "num_test_samples": 17259,
+      "seq_length": 10,
+      "comparison_csv": "PDH_test_plots\\backward_evaluation\\backward_comparison.csv",
+      "combined_plot": "PDH_test_plots\\backward_evaluation\\backward_combined_7d_plot.svg",
+      "yaw_plot": "PDH_test_plots\\backward_evaluation\\backward_yaw_plot.svg",
+      "mae_by_dim": {
+        "pos_x": 0.014235148206353188,
+        "pos_y": 0.004910116083920002,
+        "pos_z": 0.028571849688887596,
+        "rot_0": 0.002469331491738558,
+        "rot_1": 0.0077742924913764,
+        "rot_2": 0.002658326644450426,
+        "rot_3": 0.007662674877792597
+      },
+      "rmse_by_dim": {
+        "pos_x": 0.029347505420446396,
+        "pos_y": 0.005069269333034754,
+        "pos_z": 0.044354598969221115,
+        "rot_0": 0.008233855478465557,
+        "rot_1": 0.018745703622698784,
+        "rot_2": 0.011642979457974434,
+        "rot_3": 0.0168303232640028
+      }
+    }
+  }
+}
