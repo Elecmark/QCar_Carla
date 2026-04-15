@@ -1,0 +1,13 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\spec_dagger_v2\\policy_controller_dagger.pth",
+  "obs_dim": 26,
+  "action_dim": 2,
+  "iterations": 8,
+  "rollouts_per_iteration": 6,
+  "updates_per_iteration": 250,
+  "batch_size": 256,
+  "seed": 7,
+  "rollout_blend": 0.2,
+  "source_data_root": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\reference_trajectories",
+  "init_policy": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\spec_rl_v2\\policy_controller.pth"
+}

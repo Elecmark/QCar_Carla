@@ -1,0 +1,10 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\spec_rl_resampled_fix1\\policy_controller.pth",
+  "num_references": 6,
+  "mean_final_pos_error": 1.7455856402715046,
+  "mean_mean_pos_error": 0.873165629838395,
+  "mean_final_yaw_error_deg": 13.518804621982332,
+  "mean_action_saturation_rate": 0.47548684893373044,
+  "termination_rate": 0.8333333333333334,
+  "success_rate": 0.0
+}

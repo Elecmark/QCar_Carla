@@ -1,0 +1,10 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\il_smoke_v2\\policy_controller_il.pth",
+  "obs_dim": 37,
+  "action_dim": 2,
+  "epochs": 1,
+  "batches_per_epoch": 2,
+  "batch_size": 8,
+  "seed": 7,
+  "source_data_root": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\reference_trajectories"
+}

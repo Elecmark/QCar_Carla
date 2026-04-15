@@ -1,0 +1,25 @@
+{
+  "reference_name": "circle_radius5_dt0.004",
+  "steps": 299,
+  "final_info": {
+    "bundle_name": "backward",
+    "predicted_delta_x": -0.04932093620300293,
+    "predicted_delta_y": -0.0005575528484769166,
+    "predicted_delta_z": 0.0009072500979527831,
+    "predicted_delta_yaw": 1.742801308631897,
+    "step": 299,
+    "reference_name": "circle_radius5_dt0.004",
+    "reference_type": "follow",
+    "reward": -2.128547380133403,
+    "pos_error": 1.3141083717346191,
+    "quat_error": 0.5961642435408444,
+    "yaw_error_deg": 31.090814688463354,
+    "smooth_penalty": 0.005063942633569241,
+    "success_bonus": 0.0,
+    "failure_penalty": 0.0,
+    "terminated": 0.0,
+    "success": 0.0
+  },
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\rl_short_eval\\policy_controller.pth",
+  "deterministic": true
+}

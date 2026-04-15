@@ -1,0 +1,11 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\dagger_controller_v1\\policy_controller_dagger.pth",
+  "reference_action_blend": 0.0,
+  "deterministic": true,
+  "num_references": 6,
+  "mean_final_pos_error": 2.006446897983551,
+  "mean_mean_pos_error": 1.6251546325493191,
+  "mean_final_yaw_error_deg": 117.89742632922633,
+  "success_rate": 0.0,
+  "termination_rate": 0.0
+}

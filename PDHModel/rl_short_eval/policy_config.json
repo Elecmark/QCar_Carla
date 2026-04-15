@@ -1,0 +1,30 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\rl_short_eval\\policy_controller.pth",
+  "obs_dim": 33,
+  "action_dim": 2,
+  "episodes": 24,
+  "max_steps": 200,
+  "batch_size": 64,
+  "buffer_size": 20000,
+  "seed": 7,
+  "sac_config": {
+    "obs_dim": 33,
+    "action_dim": 2,
+    "hidden_dims": [
+      256,
+      256
+    ],
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "alpha_lr": 0.0003,
+    "gamma": 0.99,
+    "tau": 0.005,
+    "target_entropy": -2.0
+  },
+  "world_model": {
+    "forward_model_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\forward_world_model.pth",
+    "forward_norm_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\forward_normalization.pt",
+    "backward_model_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\backward_world_model.pth",
+    "backward_norm_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\backward_normalization.pt"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "iterations": 8,
+  "final_train_loss": 0.0009728299347334542,
+  "final_rollout_mean_pos_error": 0.8058402372826851,
+  "tensorboard_enabled": false
+}

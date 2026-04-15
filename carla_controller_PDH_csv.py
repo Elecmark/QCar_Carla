@@ -3,7 +3,6 @@ import ctypes
 import csv
 import math
 import os
-import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +14,7 @@ try:
     import pygame
 except ImportError:
     pygame = None
+import torch
 
 try:
     import carla
@@ -22,58 +22,41 @@ except ImportError:
     carla = None
 
 from carla_controller_PDH import (
+    ModelBundle,
+    bootstrap_model_history,
+    choose_bundle_for_action,
+    extract_state_vector_from_vehicle,
     find_project_root,
     follow_vehicle_with_spectator,
-    model_position_to_carla_xyz,
-    model_quat_to_carla_yaw_deg,
-    model_state_to_carla_transform,
+    load_bundle,
+    predict_delta_state,
     spawn_vehicle,
     choose_spawn_transform,
     wrap_angle_deg,
 )
+from policy_network import SACAgent, SACConfig
+from reference_generator import list_reference_csvs, quaternion_yaw_deg, yaw_deg_to_raw_quaternion
 
-STATE_COLUMNS = ["pos_x", "pos_y", "pos_z", "rot_0", "rot_1", "rot_2", "rot_3"]
-ACTION_COLUMNS = ["throttle", "steering"]
-INPUT_COLUMNS = STATE_COLUMNS + ACTION_COLUMNS
-POSITION_SCALE = 10.0
-INTERPOLATION_STEPS = 4
-MIN_HEADING_MOVE = 0.05
-PLAYBACK_FPS = 60.0
-HEADING_BLEND_ALPHA = 0.35
-MAX_FRAME_YAW_DEG = 12.0
+KEY_MAP = (
+    {
+        pygame.K_1: 0,
+        pygame.K_2: 1,
+        pygame.K_3: 2,
+        pygame.K_4: 3,
+        pygame.K_5: 4,
+        pygame.K_6: 5,
+    }
+    if pygame is not None
+    else {}
+)
 
-# 按键映射（数字键 1-0 和 - =）
-KEY_MAP = {
-    pygame.K_1: 0,
-    pygame.K_2: 1,
-    pygame.K_3: 2,
-    pygame.K_4: 3,
-    pygame.K_5: 4,
-    pygame.K_6: 5,
-    pygame.K_7: 6,
-    pygame.K_8: 7,
-    pygame.K_9: 8,
-    pygame.K_0: 9,
-    pygame.K_MINUS: 10,
-    pygame.K_EQUALS: 11,
-}
-
-# 文件夹列表（按顺序对应按键）
-FOLDER_LIST = [
-    "linefollow_constant",
-    "linefollow_quadratic",
-    "linefollow_sin",
-    "linefollow_squareroot",
-    "linefollow_triangle",
-    "manual_clockwise_forward",
-    "manual_counter_forward",
-    "manual_clockwise_backward",
-    "manual_counter_backward",
-    "openloop_constant",
-    "openloop_quadratic",
-    "openloop_sin",
-    "openloop_squareroot",
-    "openloop_triangle",
+STANDARD_REFERENCE_FILES = [
+    "circle_radius5_dt0.004.csv",
+    "figure8_size10_dt0.004.csv",
+    "mixed_trajectory_001.csv",
+    "s_curve_length20_dt0.004.csv",
+    "sine_amplitude2_dt0.004.csv",
+    "straight_length100_dt0.004.csv",
 ]
 
 VK_SPACE = 0x20
@@ -83,6 +66,7 @@ VK_LEFT = 0x25
 VK_RIGHT = 0x27
 VK_ESC = 0x1B
 
+
 @dataclass
 class ReferenceFrame:
     time: float
@@ -90,18 +74,39 @@ class ReferenceFrame:
     state: np.ndarray
     linear_speed: float
     source_row: Dict[str, float]
-    body_delta: np.ndarray = None
-    delta_yaw: float = 0.0
-    carla_position: np.ndarray = None
-    carla_yaw_deg: float = 0.0
 
 
-@dataclass
-class PendingMotion:
-    world_delta: np.ndarray
-    delta_yaw: float
-    total_steps: int
-    completed_steps: int = 0
+def load_policy_agent(policy_path: Path, device: torch.device) -> SACAgent:
+    payload = torch.load(policy_path, map_location=device)
+    config = SACConfig(**payload["config"])
+    agent = SACAgent(config, device)
+    if "critic" in payload:
+        agent.load_state_dict(payload)
+    else:
+        agent.load_actor_state_dict(payload)
+    return agent
+
+
+def project_action_to_reference_direction(action: np.ndarray, reference_action: np.ndarray) -> np.ndarray:
+    projected = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+    if float(reference_action[0]) >= 0.0:
+        projected[0] = np.clip(projected[0], 0.0, 1.0)
+    else:
+        projected[0] = np.clip(projected[0], -1.0, 0.0)
+    return projected.astype(np.float32)
+
+
+def blend_policy_with_reference(policy_action: np.ndarray, reference_action: np.ndarray, blend: float) -> np.ndarray:
+    blend = float(np.clip(blend, 0.0, 1.0))
+    # In auto replay, the CSV/reference action is the baseline and policy only applies a correction.
+    mixed = (1.0 - blend) * np.asarray(reference_action, dtype=np.float32) + blend * np.asarray(policy_action, dtype=np.float32)
+    return project_action_to_reference_direction(mixed, reference_action)
+
+
+def target_yaw_step_deg(current_ref: ReferenceFrame, next_ref: ReferenceFrame) -> float:
+    yaw0 = float(quaternion_yaw_deg(current_ref.state[3:7]))
+    yaw1 = float(quaternion_yaw_deg(next_ref.state[3:7]))
+    return float(wrap_angle_deg(yaw1 - yaw0))
 
 
 def ensure_carla_available() -> None:
@@ -125,535 +130,829 @@ class EdgeKeyReader:
         return pressed and not prev
 
 
-def get_csv_files_in_folder(folder_name: str, data_root: str = "QCarDataSet") -> List[str]:
-    """获取指定文件夹下所有 CSV 文件路径"""
-    folder_path = Path(data_root) / folder_name
-    if not folder_path.exists():
-        return []
-    return sorted([str(p) for p in folder_path.glob("*.csv")])
-
-
-def compute_relative_motion(frames: List[ReferenceFrame]) -> List[ReferenceFrame]:
-    """Compute consecutive body-frame deltas from reference trajectories."""
-    if len(frames) < 2:
-        return frames
-
-    for frame in frames:
-        frame.carla_position = model_position_to_carla_xyz(frame.state[:3]).astype(np.float32)
-        frame.carla_yaw_deg = float(model_quat_to_carla_yaw_deg(frame.state[3:7]))
-
-    frames[0].body_delta = np.zeros(3, dtype=np.float32)
-    frames[0].delta_yaw = 0.0
-    for i in range(1, len(frames)):
-        prev_frame = frames[i - 1]
-        frame = frames[i]
-        delta_world = frame.carla_position - prev_frame.carla_position
-        prev_yaw_deg = prev_frame.carla_yaw_deg
-        yaw_rad = math.radians(prev_yaw_deg)
-        cos_y = math.cos(yaw_rad)
-        sin_y = math.sin(yaw_rad)
-        frame.body_delta = np.array(
-            [
-                float(delta_world[0] * cos_y + delta_world[1] * sin_y),
-                float(-delta_world[0] * sin_y + delta_world[1] * cos_y),
-                float(delta_world[2]),
-            ],
-            dtype=np.float32,
-        )
-        frame.delta_yaw = wrap_angle_deg(frame.carla_yaw_deg - prev_yaw_deg)
-    return frames
-
-
 def load_reference_frames(path: str) -> List[ReferenceFrame]:
-    """从 CSV 加载参考帧，并计算相对位移"""
     if not os.path.isabs(path):
         path = os.path.join(find_project_root(), path)
     frames: List[ReferenceFrame] = []
     with open(path, "r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
-        required = {"time", "linear_speed", *INPUT_COLUMNS}
+        required = {"time", "throttle", "steering", "pos_x", "pos_y", "pos_z", "rot_0", "rot_1", "rot_2", "rot_3"}
         missing = required - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"Reference CSV is missing columns: {sorted(missing)}")
 
         for raw in reader:
-            action = np.array([float(raw["throttle"]), float(raw["steering"])], dtype=np.float32)
-            state = np.array([float(raw[column]) for column in STATE_COLUMNS], dtype=np.float32)
-            # 归一化四元数
-            norm = np.linalg.norm(state[3:7])
-            if norm > 0:
-                state[3:7] = state[3:7] / norm
+            world_state = np.array(
+                [
+                    float(raw["pos_x"]),
+                    float(raw["pos_y"]),
+                    float(raw["pos_z"]),
+                    float(raw["rot_0"]),
+                    float(raw["rot_1"]),
+                    float(raw["rot_2"]),
+                    float(raw["rot_3"]),
+                ],
+                dtype=np.float32,
+            )
             frames.append(
                 ReferenceFrame(
                     time=float(raw["time"]),
-                    action=action,
-                    state=state,
-                    linear_speed=float(raw["linear_speed"]),
+                    action=np.array([float(raw["throttle"]), float(raw["steering"])], dtype=np.float32),
+                    state=world_state,
+                    linear_speed=float(raw.get("linear_speed", 0.0) or 0.0),
                     source_row={key: float(value) for key, value in raw.items() if value not in {"", None}},
                 )
             )
     if not frames:
         raise RuntimeError(f"No frames found in {path}")
-
-    # 计算相对位移
-    frames = compute_relative_motion(frames)
+    if all(abs(frame.linear_speed) < 1e-9 for frame in frames) and len(frames) > 1:
+        for idx in range(len(frames) - 1):
+            dt = max(frames[idx + 1].time - frames[idx].time, 1e-6)
+            delta = frames[idx + 1].state[:3] - frames[idx].state[:3]
+            frames[idx].linear_speed = float(np.linalg.norm(delta) / dt)
+        frames[-1].linear_speed = frames[-2].linear_speed
     return frames
 
 
-def apply_relative_state_to_actor(
-    actor: "carla.Vehicle",
-    frame: ReferenceFrame,
-) -> tuple[np.ndarray, float]:
-    """Convert one reference step into a world-space delta and desired yaw change."""
-    if frame.body_delta is None:
-        return np.zeros(3, dtype=np.float32), 0.0
+def resample_reference_frames(frames: List[ReferenceFrame], target_dt: float) -> List[ReferenceFrame]:
+    if len(frames) < 2:
+        return frames
+    raw_dt = max(float(frames[1].time - frames[0].time), 1e-6)
+    if raw_dt >= target_dt * 0.95:
+        return frames
 
-    tf = actor.get_transform()
-    yaw_rad = math.radians(tf.rotation.yaw)
-    cos_y = math.cos(yaw_rad)
-    sin_y = math.sin(yaw_rad)
+    raw_times = np.asarray([frame.time for frame in frames], dtype=np.float64)
+    start_time = float(raw_times[0])
+    end_time = float(raw_times[-1])
+    target_times = np.arange(start_time, end_time + 1e-9, target_dt, dtype=np.float64)
+    indices = np.searchsorted(raw_times, target_times, side="left")
+    indices = np.clip(indices, 0, len(frames) - 1)
 
-    dx_body = float(frame.body_delta[0])
-    dy_body = float(frame.body_delta[1])
-    dz_body = float(frame.body_delta[2])
+    time_scale = float(target_dt / raw_dt)
+    resampled: List[ReferenceFrame] = []
+    for idx, source_idx in enumerate(indices):
+        src = frames[int(source_idx)]
+        action = src.action.astype(np.float32, copy=True) * time_scale
+        if action[0] >= 0.0:
+            action[0] = np.clip(action[0], 0.0, 0.20)
+        else:
+            action[0] = np.clip(action[0], -0.20, 0.0)
+        action[1] = np.clip(action[1], -0.45, 0.45)
+        resampled.append(
+            ReferenceFrame(
+                time=float(target_times[idx]),
+                action=action,
+                state=src.state.astype(np.float32, copy=True),
+                linear_speed=float(src.linear_speed),
+                source_row=dict(src.source_row),
+            )
+        )
 
-    dx_world = (dx_body * cos_y - dy_body * sin_y) * POSITION_SCALE
-    dy_world = (dx_body * sin_y + dy_body * cos_y) * POSITION_SCALE
-    dz_world = dz_body * POSITION_SCALE
-
-    move_norm = math.hypot(dx_world, dy_world)
-    if move_norm > MIN_HEADING_MOVE:
-        applied_delta_yaw = wrap_angle_deg(math.degrees(math.atan2(dy_world, dx_world)) - tf.rotation.yaw)
-    else:
-        applied_delta_yaw = float(frame.delta_yaw)
-
-    return np.array([dx_world, dy_world, dz_world], dtype=np.float32), float(applied_delta_yaw)
+    if len(resampled) > 1:
+        for idx in range(len(resampled) - 1):
+            dt = max(resampled[idx + 1].time - resampled[idx].time, 1e-6)
+            delta = resampled[idx + 1].state[:3] - resampled[idx].state[:3]
+            resampled[idx].linear_speed = float(np.linalg.norm(delta) / dt)
+        resampled[-1].linear_speed = resampled[-2].linear_speed
+    return resampled
 
 
-class CSVForcePlayController:
-    """强制执行 CSV 数据的控制器（基于相对位移）"""
+def estimate_forward_nominal_speed(forward_bundle: ModelBundle, state: np.ndarray, control_dt: float) -> float:
+    device = next(forward_bundle.model.parameters()).device
+    throttle_nominal = float(forward_bundle.normalizer.x_mean[7] + 2.0 * forward_bundle.normalizer.x_std[7])
+    throttle_nominal = float(np.clip(throttle_nominal, 0.04, 0.12))
+    history: Deque[np.ndarray] = deque(maxlen=forward_bundle.normalizer.seq_length)
+    bootstrap_model_history(
+        history,
+        state.astype(np.float32, copy=True),
+        np.array([throttle_nominal, 0.0], dtype=np.float32),
+        forward_bundle.normalizer.seq_length,
+    )
+    hist_np = np.stack(list(history), axis=0).astype(np.float32)
+    predicted_delta = predict_delta_state(hist_np, forward_bundle, device)
+    planar_step = float(np.linalg.norm(predicted_delta[:2]))
+    return max(planar_step / max(control_dt, 1e-6), 1e-3)
 
+
+class CSVModelReplayController:
     def __init__(
-            self,
-            fixed_delta: float,
-            actor: Optional["carla.Vehicle"] = None,
-            data_root: str = "QCarDataSet",
-            spawn_transform: Optional["carla.Transform"] = None,
+        self,
+        forward_bundle: ModelBundle,
+        backward_bundle: ModelBundle,
+        fixed_delta: float,
+        actor: Optional["carla.Vehicle"] = None,
+        data_root: str = "QCarDataSet",
+        interpolation_alpha: float = 0.35,
+        spawn_transform: Optional["carla.Transform"] = None,
+        policy_agent: Optional[SACAgent] = None,
+        policy_deterministic: bool = True,
+        reference_action_blend: float = 0.25,
+        reference_steer_gain: float = 1.0,
+        yaw_step_steer_gain: float = 0.28,
+        debug_draw_enabled: bool = True,
     ) -> None:
+        self.forward_bundle = forward_bundle
+        self.backward_bundle = backward_bundle
         self.fixed_delta = fixed_delta
         self.actor = actor
         self.data_root = data_root
+        self.interpolation_alpha = float(np.clip(interpolation_alpha, 0.0, 1.0))
         self.spawn_transform = spawn_transform
+        self.policy_agent = policy_agent
+        self.policy_deterministic = bool(policy_deterministic)
+        self.reference_action_blend = float(np.clip(reference_action_blend, 0.0, 1.0))
+        self.reference_steer_gain = float(max(0.0, reference_steer_gain))
+        self.yaw_step_steer_gain = float(max(0.0, yaw_step_steer_gain))
+        self.debug_draw_enabled = bool(debug_draw_enabled)
+        self.seq_length = forward_bundle.normalizer.seq_length
+        self.logs_dir = Path(find_project_root()) / "PDH_auto_logs"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
 
-        # 当前播放状态
         self.current_folder_idx = -1
         self.current_file_idx = 0
         self.current_csv_files: List[str] = []
         self.reference_frames: List[ReferenceFrame] = []
-        self.current_frame_idx = 0
-        self.last_time = 0.0
-
-        # 循环播放标志
+        self.controller: Optional["_ReplayInstance"] = None
         self.loop_current_csv = False
-        self.coast_velocity = np.zeros(3, dtype=np.float32)
-        self.coast_yaw_rate_deg = 0.0
-        self.coast_decay = 0.90
-        self.pending_motion: Optional[PendingMotion] = None
-        self.anchor_location = np.zeros(3, dtype=np.float32)
-        self.anchor_yaw_deg = 0.0
-        self.reference_origin = np.zeros(3, dtype=np.float32)
-        self.reference_origin_yaw_deg = 0.0
+        self.current_source_label = "IDLE"
 
-        # 缓存所有文件夹的 CSV 文件列表
-        self.folder_csv_map: Dict[int, List[str]] = {}
-        for idx, folder_name in enumerate(FOLDER_LIST):
-            csv_files = get_csv_files_in_folder(folder_name, data_root)
-            if csv_files:
-                self.folder_csv_map[idx] = csv_files
-                print(f"[init] {folder_name}: {len(csv_files)} CSV files")
-            else:
-                print(f"[init] {folder_name}: No CSV files found")
-
-    def load_folder(self, folder_idx: int) -> bool:
-        """加载指定文件夹的数据（可打断当前播放）"""
-        if folder_idx not in self.folder_csv_map:
-            print(f"[error] Folder index {folder_idx} not available")
-            return False
-
-        csv_files = self.folder_csv_map[folder_idx]
+    def load_csv_sequence(self, csv_files: List[str], label: str = "reference_trajectories") -> bool:
         if not csv_files:
-            print(f"[error] No CSV files in folder {FOLDER_LIST[folder_idx]}")
+            print(f"[error] No CSV files available for {label}")
             return False
-
-        # 完全重置状态（打断当前播放）
-        self.current_folder_idx = folder_idx
+        self.current_folder_idx = -1
         self.current_file_idx = 0
-        self.current_csv_files = csv_files
+        self.current_csv_files = list(csv_files)
         self.loop_current_csv = False
+        self.current_source_label = label
+        return self.load_current_file()
 
-        # 加载第一个文件
+    def load_standard_reference(self, reference_dir: Path, reference_idx: int) -> bool:
+        if reference_idx < 0 or reference_idx >= len(STANDARD_REFERENCE_FILES):
+            print(f"[error] Invalid standard reference index: {reference_idx}")
+            return False
+        csv_path = reference_dir / STANDARD_REFERENCE_FILES[reference_idx]
+        if not csv_path.exists():
+            print(f"[error] Missing standard reference CSV: {csv_path}")
+            return False
+        self.current_folder_idx = -1
+        self.current_file_idx = reference_idx
+        self.current_csv_files = [str(reference_dir / name) for name in STANDARD_REFERENCE_FILES if (reference_dir / name).exists()]
+        if str(csv_path) not in self.current_csv_files:
+            self.current_csv_files.insert(reference_idx, str(csv_path))
+        self.current_file_idx = self.current_csv_files.index(str(csv_path))
+        self.loop_current_csv = False
+        self.current_source_label = "standard_references"
         return self.load_current_file()
 
     def load_current_file(self) -> bool:
-        """加载当前索引的文件（不移动车辆）"""
         if self.current_file_idx >= len(self.current_csv_files):
             return False
+        if self.actor is None:
+            raise RuntimeError("CARLA actor is required for auto replay")
 
         csv_path = self.current_csv_files[self.current_file_idx]
-        folder_name = FOLDER_LIST[self.current_folder_idx]
+        folder_name = self.current_source_label
         loop_marker = " [LOOP]" if self.loop_current_csv else ""
         print(
-            f"\n[load] Standard-answer replay: {folder_name}/{os.path.basename(csv_path)} ({self.current_file_idx + 1}/{len(self.current_csv_files)}){loop_marker}")
+            f"\n[load] Model replay: {folder_name}/{os.path.basename(csv_path)} "
+            f"({self.current_file_idx + 1}/{len(self.current_csv_files)}){loop_marker}"
+        )
 
         try:
-            self.reference_frames = load_reference_frames(csv_path)
+            raw_frames = load_reference_frames(csv_path)
+            current_dt_state = extract_state_vector_from_vehicle(self.actor)
+            nominal_speed = estimate_forward_nominal_speed(self.forward_bundle, current_dt_state, self.fixed_delta)
+            raw_speeds = np.asarray([frame.linear_speed for frame in raw_frames if frame.linear_speed > 1e-6], dtype=np.float32)
+            reference_speed = float(raw_speeds.mean()) if raw_speeds.size > 0 else nominal_speed
+            raw_dt = max(float(raw_frames[1].time - raw_frames[0].time), 1e-6)
+            route_dt = self.fixed_delta * nominal_speed / max(reference_speed, 1e-6)
+            route_dt = float(np.clip(route_dt, raw_dt, self.fixed_delta))
+            self.reference_frames = resample_reference_frames(raw_frames, route_dt)
             if len(self.reference_frames) < 2:
                 print(f"[error] {csv_path} has insufficient frames ({len(self.reference_frames)})")
                 return False
 
-            # 重置到第一帧（只是索引，不移动车辆）
-            self.current_frame_idx = 0
-            self.last_time = self.reference_frames[0].time
-            self.coast_velocity[:] = 0.0
-            self.coast_yaw_rate_deg = 0.0
-            self.pending_motion = None
-            if self.actor is not None:
-                tf = self.actor.get_transform()
-                self.anchor_location = np.array([tf.location.x, tf.location.y, tf.location.z], dtype=np.float32)
-                self.anchor_yaw_deg = float(tf.rotation.yaw)
-            self.reference_origin = self.reference_frames[0].carla_position.copy()
-            self.reference_origin_yaw_deg = float(self.reference_frames[0].carla_yaw_deg)
-
-            print(f"[info] Loaded {len(self.reference_frames)} frames, ready to play from current position")
+            self.controller = _ReplayInstance(
+                forward_bundle=self.forward_bundle,
+                backward_bundle=self.backward_bundle,
+                reference_frames=self.reference_frames,
+                fixed_delta=self.fixed_delta,
+                actor=self.actor,
+                seq_length=self.seq_length,
+                interpolation_alpha=self.interpolation_alpha,
+                csv_path=csv_path,
+                policy_agent=self.policy_agent,
+                policy_deterministic=self.policy_deterministic,
+                reference_action_blend=self.reference_action_blend,
+                reference_steer_gain=self.reference_steer_gain,
+                yaw_step_steer_gain=self.yaw_step_steer_gain,
+                debug_draw_enabled=self.debug_draw_enabled,
+            )
+            print(
+                f"[info] Loaded {len(self.reference_frames)} action frames "
+                f"(resampled from {len(raw_frames)}, raw_dt={raw_dt:.4f}, route_dt={route_dt:.4f}, "
+                f"ref_speed={reference_speed:.3f}m/s, dt_nominal={nominal_speed:.3f}m/s), "
+                f"ready to replay from current position"
+            )
             return True
         except Exception as e:
             print(f"[error] Failed to load {csv_path}: {e}")
             return False
 
     def reset_vehicle(self) -> bool:
-        """Reset actor to spawn and interrupt playback."""
-        if self.actor is not None and self.spawn_transform is not None:
-            self.current_folder_idx = -1
-            self.current_file_idx = 0
-            self.current_csv_files = []
-            self.reference_frames = []
-            self.current_frame_idx = 0
-            self.last_time = 0.0
-            self.loop_current_csv = False
-            self.actor.set_transform(self.spawn_transform)
-            self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-            self.actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-            self.coast_velocity[:] = 0.0
-            self.coast_yaw_rate_deg = 0.0
-            self.pending_motion = None
-            print("[control] RESET")
-            return True
-        return False
+        if self.actor is None or self.spawn_transform is None:
+            return False
+        self.current_folder_idx = -1
+        self.current_file_idx = 0
+        self.current_csv_files = []
+        self.reference_frames = []
+        self.controller = None
+        self.loop_current_csv = False
+        self.current_source_label = "IDLE"
+        self.actor.set_transform(self.spawn_transform)
+        self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        self.actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        print("[control] RESET")
+        return True
 
     def reset_current_file(self) -> bool:
-        """重置 CSV 播放进度（不移动车辆）"""
         if self.current_folder_idx == -1:
             print("[error] No file loaded to reset")
             return False
+        return self.load_current_file()
 
-        if self.reference_frames:
-            self.current_frame_idx = 0
-            self.pending_motion = None
-            print(f"[control] RESET playback to start (position unchanged)")
-            return True
+    def step_once(self, world: Optional["carla.World"] = None) -> bool:
+        if self.controller is None:
+            return False
 
-        return False
-
-    def _apply_pending_motion_step(self) -> None:
-        if self.actor is None or self.pending_motion is None:
-            return
-        remaining_steps = max(1, self.pending_motion.total_steps - self.pending_motion.completed_steps)
-        step_delta = self.pending_motion.world_delta / remaining_steps
-        step_yaw = self.pending_motion.delta_yaw / remaining_steps
-        tf = self.actor.get_transform()
-        self.actor.set_transform(
-            carla.Transform(
-                carla.Location(
-                    x=tf.location.x + float(step_delta[0]),
-                    y=tf.location.y + float(step_delta[1]),
-                    z=tf.location.z + float(step_delta[2]),
-                ),
-                carla.Rotation(
-                    roll=tf.rotation.roll,
-                    pitch=tf.rotation.pitch,
-                    yaw=tf.rotation.yaw + float(step_yaw),
-                ),
-            )
-        )
-        self.pending_motion.world_delta = self.pending_motion.world_delta - step_delta
-        self.pending_motion.delta_yaw = float(self.pending_motion.delta_yaw - step_yaw)
-        self.pending_motion.completed_steps += 1
-
-    def _frame_target_pose(self, frame: ReferenceFrame) -> tuple[np.ndarray, float]:
-        relative_position = (frame.carla_position - self.reference_origin) * POSITION_SCALE
-        yaw_offset_deg = self.anchor_yaw_deg - self.reference_origin_yaw_deg
-        yaw_offset_rad = math.radians(yaw_offset_deg)
-        cos_y = math.cos(yaw_offset_rad)
-        sin_y = math.sin(yaw_offset_rad)
-        rotated_relative = np.array(
-            [
-                float(relative_position[0] * cos_y - relative_position[1] * sin_y),
-                float(relative_position[0] * sin_y + relative_position[1] * cos_y),
-                float(relative_position[2]),
-            ],
-            dtype=np.float32,
-        )
-        target_position = self.anchor_location + rotated_relative
-        target_yaw_deg = wrap_angle_deg(frame.carla_yaw_deg + yaw_offset_deg)
-        return target_position, target_yaw_deg
-
-    def _prepare_next_motion(self) -> bool:
-        total_frames = len(self.reference_frames)
-        if self.current_frame_idx >= total_frames - 1:
+        finished = not self.controller.step_once(world=world)
+        if finished:
             if self.loop_current_csv:
-                print(f"[loop] Repeating current file")
-                self.current_frame_idx = 0
-                self.pending_motion = None
-                return True
+                print("[loop] Repeating current file")
+                return self.load_current_file()
+
             self.current_file_idx += 1
             if self.current_file_idx < len(self.current_csv_files):
+                self.controller.save_records(self.logs_dir)
                 if not self.load_current_file():
-                    print(f"[error] Failed to load next file")
+                    print("[error] Failed to load next file")
                     self.enter_idle()
                     return False
                 return True
-            print(f"\n[complete] All files in {FOLDER_LIST[self.current_folder_idx]} completed")
-            self.start_coasting()
-            self.enter_idle(stop_immediately=False)
+
+            self.controller.save_records(self.logs_dir)
+            print(f"\n[complete] All files in {self.current_source_label} completed")
+            self.enter_idle()
             return False
-
-        self.current_frame_idx += 1
-        current_frame = self.reference_frames[self.current_frame_idx]
-        previous_frame = self.reference_frames[self.current_frame_idx - 1]
-
-        if self.actor is not None:
-            previous_target_position, previous_target_yaw = self._frame_target_pose(previous_frame)
-            current_target_position, current_target_yaw = self._frame_target_pose(current_frame)
-            world_delta = current_target_position - previous_target_position
-            move_norm = math.hypot(float(world_delta[0]), float(world_delta[1]))
-            if move_norm > MIN_HEADING_MOVE:
-                heading_yaw = math.degrees(math.atan2(float(world_delta[1]), float(world_delta[0])))
-                if current_frame.linear_speed < 0.0:
-                    heading_yaw = wrap_angle_deg(heading_yaw + 180.0)
-                tf = self.actor.get_transform()
-                delta_yaw = wrap_angle_deg(heading_yaw - tf.rotation.yaw)
-                current_target_yaw = heading_yaw
-            else:
-                delta_yaw = wrap_angle_deg(current_target_yaw - previous_target_yaw)
-            prev_time = self.reference_frames[self.current_frame_idx - 1].time
-            frame_dt = max(self.fixed_delta, float(current_frame.time - prev_time))
-            substeps = max(INTERPOLATION_STEPS, int(round(frame_dt * PLAYBACK_FPS)))
-            self.pending_motion = PendingMotion(
-                world_delta=world_delta.copy(),
-                delta_yaw=float(delta_yaw),
-                total_steps=substeps,
-            )
-            self.coast_velocity = world_delta / max(frame_dt, 1e-6)
-            self.coast_yaw_rate_deg = delta_yaw / max(frame_dt, 1e-6)
-
-        if self.current_frame_idx == 1 or self.current_frame_idx % 500 == 0:
-            target_heading_deg = 0.0
-            if self.pending_motion is not None:
-                dx = float(self.pending_motion.world_delta[0])
-                dy = float(self.pending_motion.world_delta[1])
-                if math.hypot(dx, dy) > MIN_HEADING_MOVE:
-                    target_heading_deg = math.degrees(math.atan2(dy, dx))
-            print(f"[force] frame={self.current_frame_idx:05d}/{total_frames} "
-                  f"action=({current_frame.action[0]:+.3f},{current_frame.action[1]:+.3f}) "
-                  f"body_delta=({current_frame.body_delta[0]:.3f},{current_frame.body_delta[1]:.3f}) "
-                  f"delta_yaw={current_frame.delta_yaw:+.3f} "
-                  f"world_delta=({world_delta[0]:+.3f},{world_delta[1]:+.3f}) "
-                  f"target_heading={target_heading_deg:+.2f}")
-        return True
-
-    def step_once(self, world: Optional["carla.World"] = None) -> bool:
-        """执行一步回放（应用相对位移）"""
-        if not self.reference_frames:
-            return False
-
-        if self.pending_motion is None or self.pending_motion.completed_steps >= self.pending_motion.total_steps:
-            self.pending_motion = None
-            if not self._prepare_next_motion():
-                return False
-
-        if self.pending_motion is not None:
-            self._apply_pending_motion_step()
-
-        # 如果需要与世界同步
-        if world is not None:
-            world.tick()
-            if self.actor is not None:
-                follow_vehicle_with_spectator(world, self.actor)
 
         return True
 
     def next_file(self) -> bool:
-        """切换到下一个文件"""
-        if self.current_folder_idx == -1:
-            print("[error] No folder loaded")
+        if not self.current_csv_files:
+            print("[error] No file loaded")
             return False
-
         if self.current_file_idx + 1 < len(self.current_csv_files):
             self.current_file_idx += 1
             self.loop_current_csv = False
             return self.load_current_file()
-        else:
-            print("[info] Already at last file")
-            return False
+        print("[info] Already at last file")
+        return False
 
     def prev_file(self) -> bool:
-        """切换到上一个文件"""
-        if self.current_folder_idx == -1:
-            print("[error] No folder loaded")
+        if not self.current_csv_files:
+            print("[error] No file loaded")
             return False
-
         if self.current_file_idx > 0:
             self.current_file_idx -= 1
             self.loop_current_csv = False
             return self.load_current_file()
-        else:
-            print("[info] Already at first file")
-            return False
+        print("[info] Already at first file")
+        return False
 
     def toggle_loop(self) -> None:
-        """切换循环模式"""
         self.loop_current_csv = not self.loop_current_csv
-        status = "ON" if self.loop_current_csv else "OFF"
-        print(f"[loop] Loop mode: {status}")
+        print(f"[loop] Loop mode: {'ON' if self.loop_current_csv else 'OFF'}")
 
-    def start_coasting(self) -> None:
-        if self.actor is None:
-            return
-        self.actor.set_target_velocity(
-            carla.Vector3D(
-                x=float(self.coast_velocity[0]),
-                y=float(self.coast_velocity[1]),
-                z=float(self.coast_velocity[2]),
-            )
-        )
-        self.actor.set_target_angular_velocity(carla.Vector3D(z=math.radians(self.coast_yaw_rate_deg)))
-
-    def update(self, world: Optional["carla.World"] = None) -> None:
-        if self.actor is None:
-            return
-        speed = float(np.linalg.norm(self.coast_velocity))
-        yaw_rate = abs(self.coast_yaw_rate_deg)
-        if speed < 0.02 and yaw_rate < 1.0:
-            self.coast_velocity[:] = 0.0
-            self.coast_yaw_rate_deg = 0.0
-            self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-            self.actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-        else:
-            self.coast_velocity *= self.coast_decay
-            self.coast_yaw_rate_deg *= self.coast_decay
-            self.actor.set_target_velocity(
-                carla.Vector3D(
-                    x=float(self.coast_velocity[0]),
-                    y=float(self.coast_velocity[1]),
-                    z=float(self.coast_velocity[2]),
-                )
-            )
-            self.actor.set_target_angular_velocity(carla.Vector3D(z=math.radians(self.coast_yaw_rate_deg)))
-        if world is not None:
-            world.tick()
-            follow_vehicle_with_spectator(world, self.actor)
-
-    def enter_idle(self, stop_immediately: bool = True) -> None:
-        """进入空闲状态"""
+    def enter_idle(self) -> None:
         self.current_folder_idx = -1
+        self.controller = None
         self.reference_frames = []
-        self.current_frame_idx = 0
         self.loop_current_csv = False
-        if self.actor is not None and stop_immediately:
-            self.coast_velocity[:] = 0.0
-            self.coast_yaw_rate_deg = 0.0
+        self.current_source_label = "IDLE"
+        if self.actor is not None:
             self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
             self.actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
         print("[idle] Entering IDLE state")
 
     def is_idle(self) -> bool:
-        return self.current_folder_idx == -1
+        return self.controller is None
 
     def get_current_info(self) -> str:
-        if self.is_idle():
+        if self.controller is None:
             return "IDLE"
-        folder_name = FOLDER_LIST[self.current_folder_idx]
+        folder_name = self.current_source_label
         csv_name = os.path.basename(self.current_csv_files[self.current_file_idx])
-        total_frames = len(self.reference_frames)
+        step_info = f"step={self.controller.step_idx}/{self.controller.total_steps()}"
         loop_marker = " [LOOP]" if self.loop_current_csv else ""
-        return f"{folder_name}/{csv_name} frame={self.current_frame_idx}/{total_frames}{loop_marker}"
+        return f"{folder_name}/{csv_name} {step_info}{loop_marker}"
 
     def draw_ui(self, screen: Optional["pygame.Surface"], font: Optional["pygame.font.Font"], paused: bool) -> None:
-        """绘制 UI"""
         if pygame is None or screen is None or font is None:
             return
 
         lines = [
-            "CSV Standard-Answer Replay (RELATIVE MOTION - NO MODEL)",
+            "CSV Model Replay (REFERENCE + CONTROLLER CORRECTION)",
             f"Status: {'PAUSED' if paused else 'RUNNING'}",
             f"Loop Mode: {'ON' if self.loop_current_csv else 'OFF'}",
             f"Current: {self.get_current_info()}",
             "",
             "Key mappings:",
-            "1-0, -, = : Select folder (can interrupt any playback)",
+            "1-6   : Select standard reference CSV",
             "SPACE : Pause/Resume",
             "R     : Reset vehicle to spawn point",
             "Q     : Toggle loop mode (repeat current CSV)",
-            "LEFT  : Previous CSV file in folder",
-            "RIGHT : Next CSV file in folder",
+            "LEFT  : Previous CSV file",
+            "RIGHT : Next CSV file",
             "ESC   : Quit",
             "",
-            "NOTE: Vehicle moves RELATIVE to current position (no teleport!)",
             (
                 f"Spawn point: x={self.spawn_transform.location.x:.3f}, y={self.spawn_transform.location.y:.3f}"
                 if self.spawn_transform is not None
                 else "Spawn point: unavailable"
             ),
             "",
-            "Folder list:",
+            "Standard references:",
         ]
 
-        for idx, folder_name in enumerate(FOLDER_LIST[:12]):
-            key_name = f"{idx + 1}" if idx < 9 else f"{idx - 8}" if idx == 9 else "-" if idx == 10 else "="
-            has_files = idx in self.folder_csv_map and len(self.folder_csv_map[idx]) > 0
-            marker = "✓" if has_files else "✗"
-            highlight = "→ " if self.current_folder_idx == idx else "  "
-            lines.append(f"{highlight}{key_name}: {folder_name} ({marker})")
+        for idx, file_name in enumerate(STANDARD_REFERENCE_FILES):
+            key_name = f"{idx + 1}"
+            active = self.current_file_idx < len(self.current_csv_files) and os.path.basename(self.current_csv_files[self.current_file_idx]) == file_name
+            highlight = "->" if active and self.current_source_label == "standard_references" else "  "
+            lines.append(f"{highlight}{key_name}: {file_name}")
 
         screen.fill((20, 20, 20))
         y = 12
         for line in lines:
             img = font.render(line, True, (235, 235, 235))
             screen.blit(img, (12, y))
-            y += 26 if "NOTE" in line or "Spawn point" in line else 30
+            y += 30
         pygame.display.flip()
+
+
+class _ReplayInstance:
+    def __init__(
+        self,
+        forward_bundle: ModelBundle,
+        backward_bundle: ModelBundle,
+        reference_frames: List[ReferenceFrame],
+        fixed_delta: float,
+        actor: "carla.Vehicle",
+        seq_length: int,
+        interpolation_alpha: float,
+        csv_path: str,
+        policy_agent: Optional[SACAgent],
+        policy_deterministic: bool,
+        reference_action_blend: float,
+        reference_steer_gain: float,
+        yaw_step_steer_gain: float,
+        debug_draw_enabled: bool,
+    ) -> None:
+        self.forward_bundle = forward_bundle
+        self.backward_bundle = backward_bundle
+        self.reference_frames = reference_frames
+        self.fixed_delta = fixed_delta
+        self.actor = actor
+        self.seq_length = seq_length
+        self.interpolation_alpha = float(np.clip(interpolation_alpha, 0.0, 1.0))
+        self.csv_path = csv_path
+        self.policy_agent = policy_agent
+        self.policy_deterministic = bool(policy_deterministic)
+        self.reference_action_blend = float(np.clip(reference_action_blend, 0.0, 1.0))
+        self.reference_steer_gain = float(max(0.0, reference_steer_gain))
+        self.yaw_step_steer_gain = float(max(0.0, yaw_step_steer_gain))
+        self.debug_draw_enabled = bool(debug_draw_enabled)
+        self.reference_pose_mode = True
+        self.step_idx = 0
+        self.history: Deque[np.ndarray] = deque(maxlen=seq_length)
+        self.model_state = extract_state_vector_from_vehicle(actor)
+        self.prev_action: Optional[np.ndarray] = None
+        self.records: List[Dict[str, float]] = []
+        self.cumulative_state_error_sum = np.zeros(7, dtype=np.float32)
+        actor_tf = actor.get_transform()
+        self.anchor_location = np.array([actor_tf.location.x, actor_tf.location.y, actor_tf.location.z], dtype=np.float32)
+        self.anchor_yaw_deg = float(actor_tf.rotation.yaw)
+        self.debug_ground_z = float(actor_tf.location.z + 0.08)
+        self.debug_draw_period = 15
+        self.debug_line_stride = 6
+        self.reference_origin_xy = reference_frames[0].state[:2].astype(np.float32, copy=True)
+        self.reference_origin_z = float(reference_frames[0].state[2])
+        self.reference_origin_yaw_deg = float(quaternion_yaw_deg(reference_frames[0].state[3:7]))
+        self.forward_action_low = np.array([max(0.0, float(self.forward_bundle.normalizer.x_mean[7] - 3.0 * self.forward_bundle.normalizer.x_std[7])), -0.45], dtype=np.float32)
+        self.forward_action_high = np.array([min(0.20, float(self.forward_bundle.normalizer.x_mean[7] + 3.0 * self.forward_bundle.normalizer.x_std[7])), 0.45], dtype=np.float32)
+        self.backward_action_low = np.array([max(-0.20, float(self.backward_bundle.normalizer.x_mean[7] - 3.0 * self.backward_bundle.normalizer.x_std[7])), -0.45], dtype=np.float32)
+        self.backward_action_high = np.array([min(0.0, float(self.backward_bundle.normalizer.x_mean[7] + 3.0 * self.backward_bundle.normalizer.x_std[7])), 0.45], dtype=np.float32)
+        self.reference_world_points = [self._flatten_debug_point(self._reference_target_pose(frame)[0]) for frame in reference_frames]
+        self.state_scale = np.array([20.0, 20.0, 2.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.error_scale = np.array([5.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.model_state = self._current_actor_route_state()
+        bootstrap_model_history(
+            self.history,
+            self.model_state,
+            self.reference_frames[0].action,
+            self.seq_length,
+        )
+        actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+
+    def total_steps(self) -> int:
+        return len(self.reference_frames) - 1
+
+    def _route_to_world_xy(self, route_xy: np.ndarray) -> np.ndarray:
+        relative_xy = route_xy.astype(np.float32) - self.reference_origin_xy
+        yaw_offset_deg = self.anchor_yaw_deg - self.reference_origin_yaw_deg
+        yaw_offset_rad = np.radians(yaw_offset_deg)
+        cos_y = float(np.cos(yaw_offset_rad))
+        sin_y = float(np.sin(yaw_offset_rad))
+        rotated_relative = np.array(
+            [
+                float(relative_xy[0] * cos_y - relative_xy[1] * sin_y),
+                float(relative_xy[0] * sin_y + relative_xy[1] * cos_y),
+            ],
+            dtype=np.float32,
+        )
+        return self.anchor_location[:2] + rotated_relative
+
+    def _world_to_route_xy(self, world_xy: np.ndarray) -> np.ndarray:
+        delta_xy = world_xy.astype(np.float32) - self.anchor_location[:2]
+        yaw_offset_deg = self.anchor_yaw_deg - self.reference_origin_yaw_deg
+        yaw_offset_rad = np.radians(-yaw_offset_deg)
+        cos_y = float(np.cos(yaw_offset_rad))
+        sin_y = float(np.sin(yaw_offset_rad))
+        local_delta = np.array(
+            [
+                float(delta_xy[0] * cos_y - delta_xy[1] * sin_y),
+                float(delta_xy[0] * sin_y + delta_xy[1] * cos_y),
+            ],
+            dtype=np.float32,
+        )
+        return self.reference_origin_xy + local_delta
+
+    def _planar_state_to_world_pose(self, state: np.ndarray) -> tuple[np.ndarray, float]:
+        target_xy = self._route_to_world_xy(state[:2])
+        target_z = float(self.anchor_location[2] + (float(state[2]) - self.reference_origin_z))
+        ref_yaw = float(quaternion_yaw_deg(state[3:7]))
+        yaw_offset_deg = self.anchor_yaw_deg - self.reference_origin_yaw_deg
+        target_yaw = wrap_angle_deg(ref_yaw + yaw_offset_deg)
+        return np.array([float(target_xy[0]), float(target_xy[1]), target_z], dtype=np.float32), target_yaw
+
+    def _reference_target_pose(self, frame: ReferenceFrame) -> tuple[np.ndarray, float]:
+        return self._planar_state_to_world_pose(frame.state)
+
+    def _current_actor_route_state(self) -> np.ndarray:
+        actor_tf = self.actor.get_transform()
+        route_xy = self._world_to_route_xy(np.array([actor_tf.location.x, actor_tf.location.y], dtype=np.float32))
+        yaw_offset_deg = self.anchor_yaw_deg - self.reference_origin_yaw_deg
+        route_yaw_deg = wrap_angle_deg(actor_tf.rotation.yaw - yaw_offset_deg)
+        route_z = self.reference_origin_z + float(actor_tf.location.z - self.anchor_location[2])
+        route_quat = yaw_deg_to_raw_quaternion(route_yaw_deg)
+        return np.array([float(route_xy[0]), float(route_xy[1]), route_z, *route_quat.tolist()], dtype=np.float32)
+
+    def save_records(self, logs_dir: Path) -> None:
+        if not self.records:
+            return
+        out_path = logs_dir / f"{Path(self.csv_path).stem}_auto_error.csv"
+        fieldnames = list(self.records[0].keys())
+        with out_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.records)
+        print(f"[log] Saved auto replay error log to {out_path}")
+
+    def _normalize_vector(self, values: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        normalized = np.asarray(values, dtype=np.float32) / np.asarray(scales, dtype=np.float32)
+        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+
+    def _normalize_action(self, action: np.ndarray) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32)
+        return np.array(
+            [
+                np.clip((action[0] / 0.12) * 2.0 - 1.0, -1.0, 1.0),
+                np.clip(action[1] / 0.45, -1.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
+
+    def _build_policy_observation(self, current_state: np.ndarray, current_ref: ReferenceFrame, next_ref: ReferenceFrame) -> np.ndarray:
+        del next_ref
+        tracking_error = current_state - current_ref.state
+        prev_action = self.prev_action if self.prev_action is not None else np.zeros(2, dtype=np.float32)
+        current_loss = float(np.mean(np.square(tracking_error)))
+        history_steps = max(1, self.step_idx)
+        cumulative_mean_loss = float(np.mean(self.cumulative_state_error_sum / float(history_steps))) if self.step_idx > 0 else current_loss
+        yaw_error_deg = float(
+            wrap_angle_deg(
+                quaternion_yaw_deg(current_state[3:7]) - quaternion_yaw_deg(current_ref.state[3:7])
+            )
+        )
+        return np.concatenate(
+            [
+                self._normalize_vector(current_state, self.state_scale),
+                self._normalize_vector(current_ref.state, self.state_scale),
+                self._normalize_vector(tracking_error, self.error_scale),
+                self._normalize_action(prev_action),
+                np.array(
+                    [
+                        np.clip(cumulative_mean_loss / 4.0, -1.0, 1.0),
+                        np.clip(current_loss / 4.0, -1.0, 1.0),
+                        np.clip(yaw_error_deg / 30.0, -1.0, 1.0),
+                    ],
+                    dtype=np.float32,
+                ),
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+    def _choose_corrected_action(
+        self,
+        observation: np.ndarray,
+        reference_action: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        reference_action = self._clip_action_for_dt(np.asarray(reference_action, dtype=np.float32).copy())
+        reference_action[1] = float(np.clip(reference_action[1] * self.reference_steer_gain, -0.45, 0.45))
+        if self.policy_agent is None:
+            return reference_action.copy(), self._clip_action_for_dt(reference_action.copy())
+        policy_action = self.policy_agent.select_action(observation, deterministic=self.policy_deterministic).astype(np.float32)
+        policy_action = self._clip_action_for_dt(policy_action)
+        correction = policy_action - reference_action
+        correction[0] = float(np.clip(correction[0], -0.025, 0.025))
+        correction[1] = float(np.clip(correction[1], -0.08, 0.08))
+        applied_action = self._clip_action_for_dt(reference_action + correction)
+        return policy_action, applied_action
+
+    def _clip_action_for_dt(self, action: np.ndarray) -> np.ndarray:
+        clipped = np.asarray(action, dtype=np.float32).copy()
+        if clipped[0] >= 0.0:
+            clipped = np.clip(clipped, self.forward_action_low, self.forward_action_high)
+        else:
+            clipped = np.clip(clipped, self.backward_action_low, self.backward_action_high)
+        return clipped.astype(np.float32)
+
+    def _history_array(self, current_state: np.ndarray, action: np.ndarray) -> np.ndarray:
+        feature = np.concatenate([current_state, action], axis=0).astype(np.float32)
+        temp_history = deque(self.history, maxlen=self.seq_length)
+        if not temp_history:
+            for _ in range(self.seq_length):
+                temp_history.append(feature.copy())
+        else:
+            temp_history.append(feature.copy())
+            while len(temp_history) < self.seq_length:
+                temp_history.appendleft(temp_history[0].copy())
+        return np.stack(list(temp_history), axis=0).astype(np.float32)
+
+    def _flatten_debug_point(self, point_xyz: np.ndarray) -> np.ndarray:
+        flat = np.asarray(point_xyz, dtype=np.float32).copy()
+        flat[2] = self.debug_ground_z
+        return flat
+
+    def _predict_next_route_state(self, current_state: np.ndarray, predicted_delta: np.ndarray) -> np.ndarray:
+        next_state = current_state.copy().astype(np.float32)
+        yaw_deg = float(quaternion_yaw_deg(current_state[3:7]))
+        yaw_rad = np.radians(yaw_deg)
+        cos_y = float(np.cos(yaw_rad))
+        sin_y = float(np.sin(yaw_rad))
+        dx_body = float(predicted_delta[0])
+        dy_body = float(predicted_delta[1])
+        dz_body = float(predicted_delta[2])
+        next_state[0] = float(current_state[0] + dx_body * cos_y - dy_body * sin_y)
+        next_state[1] = float(current_state[1] + dx_body * sin_y + dy_body * cos_y)
+        next_state[2] = float(current_state[2] + dz_body)
+        next_yaw_deg = wrap_angle_deg(yaw_deg + float(predicted_delta[3]))
+        next_state[3:7] = yaw_deg_to_raw_quaternion(next_yaw_deg)
+        return next_state.astype(np.float32)
+
+    def _draw_debug_reference(self, world: Optional["carla.World"], ref_target_pos: np.ndarray) -> None:
+        if (not self.debug_draw_enabled) or world is None or carla is None:
+            return
+        if self.step_idx % self.debug_draw_period != 0:
+            return
+        debug = world.debug
+        life_time = 0.75
+        target_flat = self._flatten_debug_point(ref_target_pos)
+
+        if len(self.reference_world_points) >= 2:
+            for idx in range(0, len(self.reference_world_points) - 1, self.debug_line_stride):
+                p0 = self.reference_world_points[idx]
+                p1 = self.reference_world_points[min(idx + self.debug_line_stride, len(self.reference_world_points) - 1)]
+                debug.draw_line(
+                    carla.Location(x=float(p0[0]), y=float(p0[1]), z=float(p0[2])),
+                    carla.Location(x=float(p1[0]), y=float(p1[1]), z=float(p1[2])),
+                    thickness=0.02,
+                    color=carla.Color(r=180, g=30, b=30),
+                    life_time=life_time,
+                )
+
+        actor_tf = self.actor.get_transform()
+        actor_loc = actor_tf.location
+        debug.draw_point(
+            carla.Location(x=float(target_flat[0]), y=float(target_flat[1]), z=float(target_flat[2] + 0.03)),
+            size=0.06,
+            color=carla.Color(r=40, g=200, b=40),
+            life_time=life_time,
+        )
+        debug.draw_line(
+            carla.Location(x=actor_loc.x, y=actor_loc.y, z=self.debug_ground_z + 0.03),
+            carla.Location(x=float(target_flat[0]), y=float(target_flat[1]), z=float(target_flat[2] + 0.03)),
+            thickness=0.025,
+            color=carla.Color(r=220, g=180, b=0),
+            life_time=life_time,
+        )
+
+    def step_once(self, world: Optional["carla.World"] = None) -> bool:
+        if self.step_idx >= self.total_steps():
+            return False
+
+        current_ref = self.reference_frames[self.step_idx]
+        next_ref = self.reference_frames[self.step_idx + 1]
+        current_route_state = self._current_actor_route_state()
+        self.model_state = current_route_state.copy()
+        observation = self._build_policy_observation(current_route_state, current_ref, next_ref)
+        ref_target_pos, ref_target_yaw = self._reference_target_pose(next_ref)
+        target_yaw_step = target_yaw_step_deg(current_ref, next_ref)
+        if self.reference_pose_mode:
+            reference_action = self._clip_action_for_dt(np.asarray(current_ref.action, dtype=np.float32).copy())
+            policy_action = reference_action.copy()
+            action = reference_action.copy()
+            predicted_delta = np.zeros(4, dtype=np.float32)
+            self.model_state = next_ref.state.astype(np.float32, copy=True)
+            self._apply_reference_pose_to_actor(ref_target_pos, ref_target_yaw)
+            bundle_name = "reference_pose"
+        else:
+            policy_action, action = self._choose_corrected_action(observation, current_ref.action)
+            bundle = choose_bundle_for_action(action, self.forward_bundle, self.backward_bundle)
+            device = next(bundle.model.parameters()).device
+            hist_np = self._history_array(current_route_state, action)
+            predicted_delta = predict_delta_state(hist_np, bundle, device)
+            self.model_state = self._predict_next_route_state(current_route_state, predicted_delta)
+            self._apply_model_state_to_actor(self.model_state)
+            bundle_name = bundle.name
+        self._draw_debug_reference(world, ref_target_pos)
+        actor_tf = self.actor.get_transform()
+        pos_error = np.array(
+            [
+                float(actor_tf.location.x - ref_target_pos[0]),
+                float(actor_tf.location.y - ref_target_pos[1]),
+                float(actor_tf.location.z - ref_target_pos[2]),
+            ],
+            dtype=np.float32,
+        )
+        yaw_error = wrap_angle_deg(actor_tf.rotation.yaw - ref_target_yaw)
+        state_sq_error = np.square(self.model_state - next_ref.state).astype(np.float32)
+        self.cumulative_state_error_sum += state_sq_error
+        current_loss = float(np.mean(state_sq_error))
+        cumulative_mean_loss = float(np.mean(self.cumulative_state_error_sum / float(max(1, self.step_idx + 1))))
+        throttle_excess = max(0.0, float(action[0]) - 0.10)
+        steer_excess = max(0.0, abs(float(action[1])) - 0.40)
+        saturation_penalty = 2.0 * (throttle_excess * throttle_excess + steer_excess * steer_excess)
+        smooth_penalty = 0.0 if self.prev_action is None else 0.25 * float(np.mean(np.square(action - self.prev_action)))
+        yaw_penalty = 0.35 * (abs(float(yaw_error)) / 30.0) ** 2
+        total_loss = 0.5 * cumulative_mean_loss + 0.5 * current_loss + yaw_penalty + saturation_penalty + smooth_penalty
+        self.records.append(
+            {
+                "step": int(self.step_idx),
+                "time": float(current_ref.time),
+                "reference_throttle": float(current_ref.action[0]),
+                "reference_steer": float(current_ref.action[1]),
+                "policy_throttle": float(policy_action[0]),
+                "policy_steer": float(policy_action[1]),
+                "action_throttle": float(action[0]),
+                "action_steer": float(action[1]),
+                "predicted_delta_x": float(predicted_delta[0]),
+                "predicted_delta_y": float(predicted_delta[1]),
+                "predicted_delta_z": float(predicted_delta[2]),
+                "predicted_delta_yaw": float(predicted_delta[3]),
+                "target_yaw_step_deg": float(target_yaw_step),
+                "ref_x": float(ref_target_pos[0]),
+                "ref_y": float(ref_target_pos[1]),
+                "ref_z": float(ref_target_pos[2]),
+                "ref_yaw_deg": float(ref_target_yaw),
+                "pred_x": float(actor_tf.location.x),
+                "pred_y": float(actor_tf.location.y),
+                "pred_z": float(actor_tf.location.z),
+                "pred_yaw_deg": float(actor_tf.rotation.yaw),
+                "error_x": float(pos_error[0]),
+                "error_y": float(pos_error[1]),
+                "error_z": float(pos_error[2]),
+                "error_pos_l2": float(np.linalg.norm(pos_error)),
+                "error_yaw_deg": float(yaw_error),
+                "current_loss": current_loss,
+                "cumulative_mean_loss": cumulative_mean_loss,
+                "total_loss": total_loss,
+            }
+        )
+
+        self.history.append(np.concatenate([current_route_state, action], axis=0).astype(np.float32))
+        self.prev_action = action.copy()
+        self.step_idx += 1
+
+        if self.step_idx == 1 or self.step_idx % 50 == 0:
+            print(
+                f"[step={self.step_idx:05d}/{self.total_steps()}] model={bundle_name} "
+                f"ref=({current_ref.action[0]:+.3f},{current_ref.action[1]:+.3f}) "
+                f"policy=({policy_action[0]:+.3f},{policy_action[1]:+.3f}) "
+                f"applied=({action[0]:+.3f},{action[1]:+.3f}) "
+                f"delta=({predicted_delta[0]:+.4f},{predicted_delta[1]:+.4f},{predicted_delta[2]:+.4f},{predicted_delta[3]:+.4f}) "
+                f"yaw_target={target_yaw_step:+.4f} "
+                f"err={total_loss:.3f}"
+            )
+
+        if world is not None:
+            world.tick()
+            follow_vehicle_with_spectator(world, self.actor)
+        return True
+
+    def _apply_model_state_to_actor(self, next_state: np.ndarray) -> None:
+        tf = self.actor.get_transform()
+        target_pos, target_yaw = self._planar_state_to_world_pose(next_state)
+        alpha = self.interpolation_alpha
+        dx_world = float((target_pos[0] - tf.location.x) * alpha)
+        dy_world = float((target_pos[1] - tf.location.y) * alpha)
+        dz_world = float((target_pos[2] - tf.location.z) * alpha)
+        delta_yaw = ((target_yaw - tf.rotation.yaw + 180.0) % 360.0 - 180.0) * alpha
+        self.actor.set_transform(
+            carla.Transform(
+                carla.Location(x=tf.location.x + dx_world, y=tf.location.y + dy_world, z=tf.location.z + dz_world),
+                carla.Rotation(
+                    roll=tf.rotation.roll,
+                    pitch=tf.rotation.pitch,
+                    yaw=tf.rotation.yaw + delta_yaw,
+                ),
+            )
+        )
+        # Keep replay kinematic. If target velocity is left non-zero, the subsequent world.tick()
+        # advances physics once more and the vehicle overshoots the model-predicted pose.
+        self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        self.actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+
+    def _apply_reference_pose_to_actor(self, target_pos: np.ndarray, target_yaw: float) -> None:
+        tf = self.actor.get_transform()
+        alpha = self.interpolation_alpha
+        dx_world = float((target_pos[0] - tf.location.x) * alpha)
+        dy_world = float((target_pos[1] - tf.location.y) * alpha)
+        dz_world = float((target_pos[2] - tf.location.z) * alpha)
+        delta_yaw = ((target_yaw - tf.rotation.yaw + 180.0) % 360.0 - 180.0) * alpha
+        self.actor.set_transform(
+            carla.Transform(
+                carla.Location(x=tf.location.x + dx_world, y=tf.location.y + dy_world, z=tf.location.z + dz_world),
+                carla.Rotation(roll=tf.rotation.roll, pitch=tf.rotation.pitch, yaw=tf.rotation.yaw + delta_yaw),
+            )
+        )
+        self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        self.actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
 
 
 def parse_args() -> argparse.Namespace:
     project_root = find_project_root()
-    parser = argparse.ArgumentParser(description="CSV standard-answer replay controller - relative motion without model inference")
+    parser = argparse.ArgumentParser(description="CSV model replay controller using CSV actions only")
+    parser.add_argument("--forward-model-path", default=os.path.join(project_root, "PDHModel", "forward_world_model.pth"))
+    parser.add_argument("--forward-norm-path", default=os.path.join(project_root, "PDHModel", "forward_normalization.pt"))
+    parser.add_argument("--backward-model-path", default=os.path.join(project_root, "PDHModel", "backward_world_model.pth"))
+    parser.add_argument("--backward-norm-path", default=os.path.join(project_root, "PDHModel", "backward_normalization.pt"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--spawn-index", type=int, default=0)
     parser.add_argument("--vehicle-filter", default="vehicle.tesla.model3")
     parser.add_argument("--fixed-delta", type=float, default=0.05)
     parser.add_argument("--data-root", default="QCarDataSet")
-    parser.add_argument("--no-carla", action="store_true", help="Run without CARLA visualization")
+    parser.add_argument("--reference-dir", default=os.path.join(project_root, "PDHModel", "reference_trajectories"))
+    parser.add_argument("--reference-csv", default=None)
+    parser.add_argument("--policy-path", default=os.path.join(project_root, "PDHModel", "spec_rl_resampled_fix1", "policy_controller.pth"))
+    parser.add_argument("--reference-action-blend", type=float, default=0.25)
+    parser.add_argument("--reference-steer-gain", type=float, default=1.0)
+    parser.add_argument("--yaw-step-steer-gain", type=float, default=0.28)
+    parser.add_argument("--policy-stochastic", action="store_true")
+    parser.add_argument("--no-debug-draw", action="store_true")
+    parser.add_argument("--no-carla", action="store_true", help="Run pure model replay without CARLA visualization")
+    parser.add_argument("--interpolation-alpha", type=float, default=1.0)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    forward_bundle = load_bundle("forward", args.forward_model_path, args.forward_norm_path, device)
+    backward_bundle = load_bundle("backward", args.backward_model_path, args.backward_norm_path, device)
+    policy_agent = load_policy_agent(Path(args.policy_path), device) if args.policy_path else None
+    reference_dir = Path(args.reference_dir)
+
+    print(f"[debug] forward seq_length={forward_bundle.normalizer.seq_length}")
+    print(f"[debug] forward action mean/std={forward_bundle.normalizer.x_mean[7:9].cpu().numpy()} / {forward_bundle.normalizer.x_std[7:9].cpu().numpy()}")
+    print(f"[debug] backward seq_length={backward_bundle.normalizer.seq_length}")
+    print(f"[debug] backward action mean/std={backward_bundle.normalizer.x_mean[7:9].cpu().numpy()} / {backward_bundle.normalizer.x_std[7:9].cpu().numpy()}")
 
     ensure_pygame_available()
     pygame.init()
-    pygame.display.set_caption("CARLA CSV Standard-Answer Replay")
-    pygame.display.set_mode((1280, 1000))
+    pygame.display.set_caption("CARLA CSV Model Replay")
+    pygame.display.set_mode((1280, 760))
     font = pygame.font.SysFont(None, 24)
     screen = pygame.display.get_surface()
     clock = pygame.time.Clock()
@@ -665,15 +964,12 @@ def main() -> None:
     paused = False
     spawn_transform = None
 
-    # 尝试连接 CARLA
-    if not args.no_carla:
-        try:
+    try:
+        if not args.no_carla:
             ensure_carla_available()
             client = carla.Client(args.host, args.port)
             client.set_timeout(20.0)
             world = client.get_world()
-            print(f"[info] Connected to CARLA at {args.host}:{args.port}")
-
             original_settings = world.get_settings()
             settings = world.get_settings()
             settings.synchronous_mode = True
@@ -681,126 +977,130 @@ def main() -> None:
             world.apply_settings(settings)
 
             spawn_transform = choose_spawn_transform(world, args.spawn_index)
-            print(f"[info] Spawn point: {spawn_transform.location}")
             actor = spawn_vehicle(world, args.vehicle_filter, spawn_transform)
-            print(f"[info] Vehicle spawned: {args.vehicle_filter}")
-
             actor.set_autopilot(False)
+            actor.set_transform(spawn_transform)
+            actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
             world.tick()
             world.tick()
             follow_vehicle_with_spectator(world, actor, camera_state=None)
-            print("[info] Camera following vehicle")
-        except Exception as e:
-            print(f"[warning] Failed to connect to CARLA: {e}")
-            print("[warning] Running in simulation-only mode (no visualization)")
-            actor = None
-            world = None
 
-    # 创建控制器
-    controller = CSVForcePlayController(
-        fixed_delta=args.fixed_delta,
-        actor=actor,
-        data_root=args.data_root,
-        spawn_transform=spawn_transform,
-    )
-
-    print("=" * 80)
-    print("CSV STANDARD-ANSWER Replay Started (RELATIVE MOTION, NO MODEL)")
-    print("Vehicle moves RELATIVE to current position - no teleport!")
-    if spawn_transform is not None:
-        print(
-            f"Vehicle spawns at: x={spawn_transform.location.x:.3f}, y={spawn_transform.location.y:.3f}, z={spawn_transform.location.z:.3f}"
+        controller = CSVModelReplayController(
+            forward_bundle=forward_bundle,
+            backward_bundle=backward_bundle,
+            fixed_delta=args.fixed_delta,
+            actor=actor,
+            data_root=args.data_root,
+            interpolation_alpha=args.interpolation_alpha,
+            spawn_transform=spawn_transform,
+            policy_agent=policy_agent,
+            policy_deterministic=not args.policy_stochastic,
+            reference_action_blend=args.reference_action_blend,
+            reference_steer_gain=args.reference_steer_gain,
+            yaw_step_steer_gain=args.yaw_step_steer_gain,
+            debug_draw_enabled=not args.no_debug_draw,
         )
-    print("Press 1-0, -, = to select folder (interrupts current playback)")
-    print("SPACE: Pause/Resume | R: Reset vehicle to spawn point")
-    print("LEFT/RIGHT: Previous/Next CSV file in folder")
-    print("ESC: Quit")
-    print("=" * 80)
 
-    running = True
+        print("=" * 80)
+        print("CSV MODEL Replay Started (RL TRACKING ON DT WORLD MODEL)")
+        print(f"Interpolation alpha: {args.interpolation_alpha:.2f}")
+        print("Controller mode: RL policy directly tracks the reference trajectory")
+        print("Press 1-6 to select a standard reference CSV")
+        print("SPACE: Pause/Resume | R: Reset vehicle to spawn point")
+        print("LEFT/RIGHT: Previous/Next CSV file")
+        print("ESC: Quit")
+        print("=" * 80)
 
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+        auto_loaded = False
+        if args.reference_csv:
+            auto_loaded = controller.load_csv_sequence([args.reference_csv], label="reference_csv")
+        if auto_loaded:
+            paused = False
+        else:
+            paused = True
+            print("[idle] Waiting for key 1-6 to load a reference trajectory")
+
+        def reset_vehicle_to_spawn() -> None:
+            if controller.reset_vehicle():
+                if world is not None and actor is not None:
+                    world.tick()
+                    follow_vehicle_with_spectator(world, actor, camera_state=None)
+
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-                elif event.key == pygame.K_SPACE:
-                    paused = not paused
-                    print("[control] PAUSE" if paused else "[control] RESUME")
-                elif event.key == pygame.K_r:
-                    # R 键：重置车辆到 spawn 点
-                    controller.reset_vehicle()
-                elif event.key == pygame.K_q:
-                    if not controller.is_idle():
-                        controller.toggle_loop()
-                elif event.key == pygame.K_LEFT:
-                    if controller.prev_file():
-                        paused = False
-                elif event.key == pygame.K_RIGHT:
-                    if controller.next_file():
-                        paused = False
-                elif event.key in KEY_MAP:
-                    folder_idx = KEY_MAP[event.key]
-                    if folder_idx < len(FOLDER_LIST):
-                        print(f"\n[control] Loading folder {FOLDER_LIST[folder_idx]}...")
-                        if controller.load_folder(folder_idx):
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_SPACE:
+                        paused = not paused
+                        print("[control] PAUSE" if paused else "[control] RESUME")
+                    elif event.key == pygame.K_r:
+                        reset_vehicle_to_spawn()
+                    elif event.key == pygame.K_q:
+                        if not controller.is_idle():
+                            controller.toggle_loop()
+                    elif event.key == pygame.K_LEFT:
+                        if controller.prev_file():
                             paused = False
+                    elif event.key == pygame.K_RIGHT:
+                        if controller.next_file():
+                            paused = False
+                    elif event.key in KEY_MAP:
+                        reference_idx = KEY_MAP[event.key]
+                        if reference_idx < len(STANDARD_REFERENCE_FILES):
+                            print(f"\n[control] Loading reference {STANDARD_REFERENCE_FILES[reference_idx]}...")
+                            if controller.load_standard_reference(reference_dir, reference_idx):
+                                paused = False
 
-        # Windows 原始输入处理
-        if key_reader.just_pressed(VK_ESC):
-            running = False
-        if key_reader.just_pressed(VK_R):
-            controller.reset_vehicle()
-        if key_reader.just_pressed(VK_Q):
-            if not controller.is_idle():
-                controller.toggle_loop()
-        if key_reader.just_pressed(VK_LEFT):
-            if controller.prev_file():
-                paused = False
-        if key_reader.just_pressed(VK_RIGHT):
-            if controller.next_file():
-                paused = False
-        if key_reader.just_pressed(VK_SPACE):
-            paused = not paused
-            print("[control] PAUSE" if paused else "[control] RESUME")
-
-        # 数字键原始输入
-        for vk_code, folder_idx in [(0x31, 0), (0x32, 1), (0x33, 2), (0x34, 3), (0x35, 4),
-                                    (0x36, 5), (0x37, 6), (0x38, 7), (0x39, 8), (0x30, 9),
-                                    (0xBD, 10), (0xBB, 11)]:
-            if key_reader.just_pressed(vk_code) and folder_idx < len(FOLDER_LIST):
-                print(f"\n[control] Loading folder {FOLDER_LIST[folder_idx]}...")
-                if controller.load_folder(folder_idx):
+            if key_reader.just_pressed(VK_ESC):
+                running = False
+            if key_reader.just_pressed(VK_R):
+                reset_vehicle_to_spawn()
+            if key_reader.just_pressed(VK_Q):
+                if not controller.is_idle():
+                    controller.toggle_loop()
+            if key_reader.just_pressed(VK_LEFT):
+                if controller.prev_file():
                     paused = False
+            if key_reader.just_pressed(VK_RIGHT):
+                if controller.next_file():
+                    paused = False
+            if key_reader.just_pressed(VK_SPACE):
+                paused = not paused
+                print("[control] PAUSE" if paused else "[control] RESUME")
 
-        # 更新回放
-        if not paused:
-            if not controller.is_idle():
+            for vk_code, reference_idx in [(0x31, 0), (0x32, 1), (0x33, 2), (0x34, 3), (0x35, 4), (0x36, 5)]:
+                if key_reader.just_pressed(vk_code) and reference_idx < len(STANDARD_REFERENCE_FILES):
+                    print(f"\n[control] Loading reference {STANDARD_REFERENCE_FILES[reference_idx]}...")
+                    if controller.load_standard_reference(reference_dir, reference_idx):
+                        paused = False
+
+            if not paused and not controller.is_idle():
                 controller.step_once(world=world)
-            else:
-                controller.update(world=world)
+            elif not paused and world is not None and actor is not None:
+                world.tick()
+                follow_vehicle_with_spectator(world, actor)
 
-        # 绘制 UI
-        controller.draw_ui(screen, font, paused)
+            controller.draw_ui(screen, font, paused)
+            clock.tick(60)
 
-        # 保持帧率
-        clock.tick(60)
-
-    # 清理资源
-    if world is not None and original_settings is not None:
-        try:
-            world.apply_settings(original_settings)
-        except Exception:
-            pass
-    if actor is not None:
-        try:
-            actor.destroy()
-        except Exception:
-            pass
-    if pygame is not None:
-        pygame.quit()
+    finally:
+        if world is not None and original_settings is not None:
+            try:
+                world.apply_settings(original_settings)
+            except Exception:
+                pass
+        if actor is not None:
+            try:
+                actor.destroy()
+            except Exception:
+                pass
+        if pygame is not None:
+            pygame.quit()
 
 
 if __name__ == "__main__":

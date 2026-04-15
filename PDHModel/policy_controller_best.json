@@ -1,0 +1,8 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\policy_controller_best.pth",
+  "source_policy": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\dagger_controller_v1\\policy_controller_dagger.pth",
+  "controller_type": "dagger_from_il",
+  "recommended_reference_action_blend": 0.25,
+  "recommended_deploy_command": "python deploy_rl_controller.py --policy PDHModel/policy_controller_best.pth --device cpu --deterministic",
+  "evaluation_summary": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\eval_dagger_v1_blend025\\evaluation_summary.json"
+}

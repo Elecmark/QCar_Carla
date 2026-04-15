@@ -1,0 +1,11 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\recovery_rl\\policy_controller.pth",
+  "reference_action_blend": 0.0,
+  "deterministic": true,
+  "num_references": 6,
+  "mean_final_pos_error": 2.234839071830114,
+  "mean_mean_pos_error": 1.2743270253781935,
+  "mean_final_yaw_error_deg": 111.51268136713948,
+  "success_rate": 0.0,
+  "termination_rate": 0.16666666666666666
+}

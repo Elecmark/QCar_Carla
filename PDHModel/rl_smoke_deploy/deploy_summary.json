@@ -1,0 +1,25 @@
+{
+  "reference_name": "straight",
+  "steps": 7,
+  "final_info": {
+    "bundle_name": "backward",
+    "predicted_delta_x": -0.04537251964211464,
+    "predicted_delta_y": -0.000275983678875491,
+    "predicted_delta_z": 0.0006706007989123464,
+    "predicted_delta_yaw": -1.7861136198043823,
+    "step": 7,
+    "reference_name": "straight",
+    "reference_type": "straight",
+    "reward": -0.1722303310357471,
+    "pos_error": 0.2873627543449402,
+    "quat_error": 0.1457349065050392,
+    "yaw_error_deg": 8.349992966471177,
+    "smooth_penalty": 0.00828184001147747,
+    "success_bonus": 0.0,
+    "failure_penalty": 0.0,
+    "terminated": 0.0,
+    "success": 0.0
+  },
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\rl_smoke\\policy_controller.pth",
+  "deterministic": true
+}

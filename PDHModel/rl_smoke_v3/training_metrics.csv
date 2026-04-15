@@ -1,0 +1,2 @@
+episode,steps,episode_reward,avg_pos_error,actor_loss,critic_loss,alpha
+1.0,5.0,9.802219495814674,0.057667318359017374,0.0,0.0,0.09999999403953552

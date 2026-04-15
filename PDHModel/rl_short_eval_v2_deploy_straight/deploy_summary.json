@@ -1,0 +1,33 @@
+{
+  "reference_name": "straight_length100_dt0.004",
+  "steps": 235,
+  "final_info": {
+    "bundle_name": "forward",
+    "predicted_delta_x": 0.03573144972324371,
+    "predicted_delta_y": -0.00016064164810813963,
+    "predicted_delta_z": 0.00042929931078106165,
+    "predicted_delta_yaw": -1.1991842985153198,
+    "step": 235,
+    "reference_name": "straight_length100_dt0.004",
+    "reference_type": "follow",
+    "raw_action_throttle": 0.7480171918869019,
+    "raw_action_steering": 0.7933269143104553,
+    "applied_action_throttle": 0.7480171918869019,
+    "applied_action_steering": 0.7933269143104553,
+    "reference_action_throttle": 0.053333282470703125,
+    "reference_action_steering": 0.0,
+    "reward": -21.64075008390898,
+    "pos_error": 4.012136936187744,
+    "quat_error": 0.6962115005413007,
+    "yaw_error_deg": 39.88997555105851,
+    "smooth_penalty": 0.009888460859656334,
+    "direction_mismatch_penalty": 0.0,
+    "reference_action_gap": 1.0544919967651367,
+    "success_bonus": 0.0,
+    "failure_penalty": 5.0,
+    "terminated": 1.0,
+    "success": 0.0
+  },
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\rl_short_eval_v2\\policy_controller.pth",
+  "deterministic": true
+}

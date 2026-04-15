@@ -126,6 +126,8 @@ class PredictionInfo:
     delta_xy_body: np.ndarray
     delta_yaw: float
     predicted_delta: np.ndarray
+    yaw_delta_raw: float
+    yaw_jump_suppressed: int
 
 
 @dataclass
@@ -681,6 +683,7 @@ class QCarVehicle:
         self.history: Deque[np.ndarray] = deque(maxlen=self.seq_length)
         self.model_state = extract_state_vector_from_vehicle(actor)
         self.last_prediction: Optional[PredictionInfo] = None
+        self.last_yaw_delta_cmd = 0.0
         bootstrap_model_history(
             self.history,
             self.model_state,
@@ -699,12 +702,35 @@ class QCarVehicle:
         self.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
         self.model_state = extract_state_vector_from_vehicle(self.actor)
         self.last_prediction = None
+        self.last_yaw_delta_cmd = 0.0
         bootstrap_model_history(
             self.history,
             self.model_state,
             np.array([0.0, 0.0], dtype=np.float32),
             self.seq_length,
         )
+
+    def _stabilize_predicted_output(self, bundle_name: str, action: np.ndarray, predicted_output: np.ndarray) -> np.ndarray:
+        stabilized = predicted_output.astype(np.float32, copy=True)
+        yaw_delta_raw = float(stabilized[3])
+
+        if bundle_name == "backward" and abs(float(action[1])) >= 0.15:
+            prev = float(self.last_yaw_delta_cmd)
+            curr = yaw_delta_raw
+            large_prev = abs(prev) >= 0.6
+            large_curr = abs(curr) >= 0.6
+            sign_flip = (prev * curr) < 0.0
+
+            if large_prev and large_curr and sign_flip:
+                replacement = prev
+                stabilized[3] = float(np.clip(replacement, -1.5, 1.5))
+            else:
+                stabilized[3] = float(np.clip(curr, -1.5, 1.5))
+        else:
+            stabilized[3] = float(np.clip(yaw_delta_raw, -2.0, 2.0))
+
+        self.last_yaw_delta_cmd = float(stabilized[3])
+        return stabilized
 
     def apply_control(self, control: "carla.VehicleControl", device: torch.device) -> None:
         action = control_to_action(control)
@@ -720,10 +746,11 @@ class QCarVehicle:
             history_copy.appendleft(feature.copy())
 
         hist_np = np.stack(list(history_copy), axis=0).astype(np.float32)
-        predicted_output = predict_delta_state(hist_np, bundle, device)
+        predicted_output_raw = predict_delta_state(hist_np, bundle, device)
+        predicted_output = self._stabilize_predicted_output(bundle.name, action, predicted_output_raw)
         next_state = predicted_output_to_next_state(current_state, predicted_output)
 
-        self._apply_model_state_transition(current_state, next_state, bundle.name, action, predicted_output)
+        self._apply_model_state_transition(current_state, next_state, bundle.name, action, predicted_output, predicted_output_raw)
         self.model_state = next_state.copy()
         self.history.append(np.concatenate([self.model_state, action], axis=0).astype(np.float32))
 
@@ -734,6 +761,7 @@ class QCarVehicle:
         bundle_name: str,
         action: np.ndarray,
         predicted_delta: np.ndarray,
+        predicted_delta_raw: np.ndarray,
     ) -> None:
         tf = self.actor.get_transform()
         target_tf = model_state_to_carla_transform(next_model_state)
@@ -766,6 +794,8 @@ class QCarVehicle:
             delta_xy_body=np.array([dx_world, dy_world], dtype=np.float32),
             delta_yaw=delta_yaw,
             predicted_delta=predicted_delta.copy(),
+            yaw_delta_raw=float(predicted_delta_raw[3]),
+            yaw_jump_suppressed=int(abs(float(predicted_delta[3]) - float(predicted_delta_raw[3])) > 1e-6),
         )
 
 
@@ -1034,6 +1064,8 @@ def main() -> None:
                     "pred_delta_1": 0.0 if pred is None else float(pred.predicted_delta[1]),
                     "pred_delta_2": 0.0 if pred is None else float(pred.predicted_delta[2]),
                     "pred_delta_3": 0.0 if pred is None else float(pred.predicted_delta[3]),
+                    "pred_delta_3_raw": 0.0 if pred is None else float(pred.yaw_delta_raw),
+                    "yaw_jump_suppressed": 0 if pred is None else int(pred.yaw_jump_suppressed),
                 }
             )
 
@@ -1052,7 +1084,7 @@ def main() -> None:
             if pred is not None:
                 lines.insert(
                     3,
-                    f"Applied world dx={pred.delta_xy_body[0]:.4f}, dy={pred.delta_xy_body[1]:.4f}, yaw_delta={pred.delta_yaw:.3f}",
+                    f"Applied world dx={pred.delta_xy_body[0]:.4f}, dy={pred.delta_xy_body[1]:.4f}, yaw_delta={pred.delta_yaw:.3f}, raw_yaw_delta={pred.yaw_delta_raw:.3f}, suppressed={pred.yaw_jump_suppressed}",
                 )
                 lines.insert(7, format_vector("Pred delta7", pred.predicted_delta))
 
