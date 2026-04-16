@@ -1,0 +1,7 @@
+{
+  "episodes": 120,
+  "total_steps": 5147,
+  "final_reward": -27.27937294355197,
+  "final_pos_error": 1.1631342488985794,
+  "tensorboard_enabled": false
+}

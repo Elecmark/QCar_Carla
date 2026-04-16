@@ -149,16 +149,18 @@ def search_expert_action(env: DTModelEnv) -> np.ndarray:
     current_ref = env.reference.states[min(env.step_idx, len(env.reference.states) - 1)]
     target_step_distance = float(np.linalg.norm(next_ref[:2] - current_ref[:2]))
     target_yaw_step = float(np.mean(np.square(next_ref[3:7] - current_ref[3:7])))
+    baseline_action = env._baseline_action()
 
-    throttle_values = np.linspace(0.02, 0.12, 6, dtype=np.float32)
-    steer_values = np.linspace(-0.35, 0.35, 15, dtype=np.float32)
-    best_action = np.array([0.06, 0.0], dtype=np.float32)
+    throttle_values = np.linspace(-0.03, 0.03, 7, dtype=np.float32)
+    steer_values = np.linspace(-0.12, 0.12, 13, dtype=np.float32)
+    best_action = baseline_action.copy()
     best_score = float("inf")
-    prev_action = env.prev_action.copy() if env.prev_action is not None else np.array([0.06, 0.0], dtype=np.float32)
+    prev_action = env.prev_action.copy() if env.prev_action is not None else baseline_action.copy()
 
-    for throttle in throttle_values:
-        for steer in steer_values:
-            candidate = env._project_action(np.array([float(throttle), float(steer)], dtype=np.float32))
+    for throttle_residual in throttle_values:
+        for steer_residual in steer_values:
+            candidate_residual = np.array([float(throttle_residual), float(steer_residual)], dtype=np.float32)
+            candidate = env._project_final_action(baseline_action + candidate_residual)
             bundle = choose_bundle_for_action(candidate, env.forward_model, env.backward_model)
             history_np = env._history_array(candidate)
             predicted_delta = predict_delta_state(history_np, bundle, env.device)
@@ -188,13 +190,13 @@ def search_expert_action(env: DTModelEnv) -> np.ndarray:
                 best_score = score
                 best_action = candidate.copy()
 
-    return best_action.astype(np.float32)
+    return env.expert_action_to_policy_target(best_action.astype(np.float32))
 
 
 def reference_expert_action(env: DTModelEnv) -> np.ndarray:
     assert env.reference is not None
     action_idx = min(env.step_idx, env.reference.actions.shape[0] - 1)
-    return env._project_action(env.reference.actions[action_idx].astype(np.float32, copy=True))
+    return env.expert_action_to_policy_target(env.reference.actions[action_idx].astype(np.float32, copy=True))
 
 
 def load_initial_policy(agent: SACAgent, policy_path: Path, device: torch.device) -> None:

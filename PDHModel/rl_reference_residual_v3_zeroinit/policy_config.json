@@ -1,0 +1,32 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\rl_reference_residual_v3_zeroinit\\policy_controller.pth",
+  "obs_dim": 26,
+  "action_dim": 2,
+  "episodes": 120,
+  "max_steps": 200,
+  "batch_size": 256,
+  "buffer_size": 1000000,
+  "seed": 7,
+  "reset_position_noise_xy": 0.75,
+  "reset_yaw_noise_deg": 20.0,
+  "sac_config": {
+    "obs_dim": 26,
+    "action_dim": 2,
+    "hidden_dims": [
+      256,
+      256
+    ],
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "alpha_lr": 0.0003,
+    "gamma": 0.99,
+    "tau": 0.001,
+    "target_entropy": -2.0
+  },
+  "world_model": {
+    "forward_model_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\forward_world_model.pth",
+    "forward_norm_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\forward_normalization.pt",
+    "backward_model_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\backward_world_model.pth",
+    "backward_norm_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\backward_normalization.pt"
+  }
+}

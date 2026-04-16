@@ -1,0 +1,30 @@
+# QCar_WorldModel-main Python dependencies
+#
+# Recommended:
+#   Python 3.10
+#   pip install -r requirements.txt
+#
+# Notes:
+# - CARLA Python API is usually installed separately to match your local CARLA version.
+# - If you need CARLA runtime scripts, install the matching `carla` egg/wheel from your CARLA package.
+
+# Core numerical / model runtime
+numpy
+torch
+
+# CARLA runtime UI / control
+pygame
+
+# Data processing / plotting
+pandas
+matplotlib
+
+# RL / environment interface
+gymnasium
+
+# Optional training logging
+tensorboard
+
+# CARLA Python API
+# Install separately to match your CARLA simulator version, for example:
+# carla==0.9.15

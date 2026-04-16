@@ -1,0 +1,5 @@
+{
+  "epochs": 6,
+  "final_train_loss": 0.020985732970681664,
+  "tensorboard_enabled": false
+}

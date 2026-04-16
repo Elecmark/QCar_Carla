@@ -1,0 +1,10 @@
+{
+  "policy_path": "B:\\code\\carla\\QCar_WorldModel-main\\PDHModel\\il_controller_qcardataset_smoke\\policy_controller_il.pth",
+  "obs_dim": 26,
+  "action_dim": 2,
+  "epochs": 6,
+  "batches_per_epoch": 24,
+  "batch_size": 256,
+  "seed": 7,
+  "source_data_root": "B:\\code\\carla\\QCar_WorldModel-main\\QCarDataSet"
+}

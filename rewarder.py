@@ -23,7 +23,6 @@ def compute_reward(
     yaw_weight: float = 0.35,
     action_saturation_weight: float = 0.75,
     action_smooth_weight: float = 0.25,
-    progress_weight: float = 0.35,
     success_position_threshold: float = 0.20,
     failure_position_threshold: float = 2.0,
     failure_yaw_threshold_deg: float = 30.0,
@@ -57,11 +56,9 @@ def compute_reward(
         smooth_penalty = action_smooth_weight * float(np.mean(np.square(current_action - prev)))
 
     pos_error = float(np.linalg.norm(predicted[:3] - reference[:3]))
-    current_pos_error = float(np.linalg.norm(np.asarray(reference_current_state[:3], dtype=np.float32) - predicted[:3]))
-    progress_bonus = progress_weight * max(0.0, current_pos_error - pos_error)
     base_loss = alpha * cumulative_mean_loss + (1.0 - alpha) * current_loss
     total_loss = float(base_loss + yaw_penalty + action_saturation_penalty + smooth_penalty)
-    reward = float(progress_bonus - total_loss)
+    reward = float(-total_loss)
     success = pos_error <= success_position_threshold and yaw_error_deg <= 10.0
     terminated = pos_error >= failure_position_threshold or yaw_error_deg >= failure_yaw_threshold_deg
 
@@ -76,7 +73,6 @@ def compute_reward(
         "yaw_penalty": float(yaw_penalty),
         "action_saturation_penalty": float(action_saturation_penalty),
         "smooth_penalty": float(smooth_penalty),
-        "progress_bonus": float(progress_bonus),
         "terminated": float(terminated),
         "success": float(success),
         "updated_cumulative_state_error_sum": cumulative_error_sum.astype(np.float32),

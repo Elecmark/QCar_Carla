@@ -666,12 +666,19 @@ class _ReplayInstance:
         next_ref: ReferenceFrame,
         observation: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if self.use_rl_correction and self.policy_agent is not None:
-            policy_action = self.policy_agent.select_action(observation, deterministic=self.policy_deterministic).astype(np.float32)
-            policy_action = self._clip_action_for_dt(policy_action)
-            return policy_action, policy_action.copy()
-
         baseline_action = self._build_baseline_action(current_state, current_ref, next_ref)
+        if self.use_rl_correction and self.policy_agent is not None:
+            residual_action = self.policy_agent.select_action(observation, deterministic=self.policy_deterministic).astype(np.float32)
+            residual_action = np.array(
+                [
+                    float(np.clip(residual_action[0], -0.06, 0.06)),
+                    float(np.clip(residual_action[1], -0.25, 0.25)),
+                ],
+                dtype=np.float32,
+            )
+            applied_action = self._clip_action_for_dt(baseline_action + residual_action)
+            return residual_action, applied_action
+
         baseline_action = self._clip_action_for_dt(baseline_action)
         return baseline_action.copy(), baseline_action.copy()
 

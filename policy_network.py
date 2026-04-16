@@ -9,6 +9,8 @@ import torch.nn.functional as F
 
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
+THROTTLE_RESIDUAL_LIMIT = 0.03
+STEER_RESIDUAL_LIMIT = 0.12
 
 
 def build_mlp(input_dim: int, hidden_dims: Tuple[int, ...], output_dim: int) -> nn.Sequential:
@@ -30,8 +32,8 @@ class PolicyNetwork(nn.Module):
     Input:
         - observation: current state + reference state + error + context
     Output:
-        - throttle in [-1, 1]
-        - steering in [-1, 1]
+        - throttle residual in [-0.06, 0.06]
+        - steering residual in [-0.25, 0.25]
     """
 
     def __init__(self, obs_dim: int, action_dim: int = 2, hidden_dims: Tuple[int, ...] = (256, 256)) -> None:
@@ -45,8 +47,8 @@ class PolicyNetwork(nn.Module):
         del observation
         throttle = action[..., :1]
         steering = action[..., 1:]
-        constrained_throttle = 0.06 * (throttle + 1.0)
-        constrained_steering = 0.45 * steering
+        constrained_throttle = THROTTLE_RESIDUAL_LIMIT * throttle
+        constrained_steering = STEER_RESIDUAL_LIMIT * steering
         return torch.cat([constrained_throttle, constrained_steering], dim=-1)
 
     def forward(self, observation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

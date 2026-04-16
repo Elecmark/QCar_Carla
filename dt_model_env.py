@@ -15,6 +15,7 @@ from carla_controller_PDH import (
     predicted_output_to_next_state,
     wrap_angle_deg,
 )
+from policy_network import STEER_RESIDUAL_LIMIT, THROTTLE_RESIDUAL_LIMIT
 from reference_generator import ReferenceTrajectory
 from rewarder import compute_reward
 
@@ -77,7 +78,12 @@ class DTModelEnv(gym.Env):
         self.env_config = env_config or EnvConfig()
         self.seq_length = int(forward_model.normalizer.seq_length)
 
-        self.action_space = spaces.Box(low=np.array([0.0, -0.45], dtype=np.float32), high=np.array([0.12, 0.45], dtype=np.float32), shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=np.array([-THROTTLE_RESIDUAL_LIMIT, -STEER_RESIDUAL_LIMIT], dtype=np.float32),
+            high=np.array([THROTTLE_RESIDUAL_LIMIT, STEER_RESIDUAL_LIMIT], dtype=np.float32),
+            shape=(2,),
+            dtype=np.float32,
+        )
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(26,), dtype=np.float32)
 
         self.history: Deque[np.ndarray] = deque(maxlen=self.seq_length)
@@ -104,6 +110,7 @@ class DTModelEnv(gym.Env):
         )
         self.state_scale = np.array([20.0, 20.0, 2.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
         self.error_scale = np.array([5.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.residual_penalty_weight = 0.20
 
     def _normalize_vector(self, values: np.ndarray, scales: np.ndarray) -> np.ndarray:
         normalized = np.asarray(values, dtype=np.float32) / np.asarray(scales, dtype=np.float32)
@@ -132,13 +139,55 @@ class DTModelEnv(gym.Env):
         action_idx = min(self.step_idx, self.reference.actions.shape[0] - 1)
         return self.reference.actions[action_idx].astype(np.float32, copy=True)
 
-    def _project_action(self, action: np.ndarray) -> np.ndarray:
+    def _project_residual_action(self, action: np.ndarray) -> np.ndarray:
+        projected = np.asarray(action, dtype=np.float32).copy()
+        projected[0] = np.clip(projected[0], -THROTTLE_RESIDUAL_LIMIT, THROTTLE_RESIDUAL_LIMIT)
+        projected[1] = np.clip(projected[1], -STEER_RESIDUAL_LIMIT, STEER_RESIDUAL_LIMIT)
+        return projected.astype(np.float32)
+
+    def _project_final_action(self, action: np.ndarray) -> np.ndarray:
         projected = np.asarray(action, dtype=np.float32).copy()
         projected[0] = np.clip(projected[0], 0.0, 0.12)
         projected[1] = np.clip(projected[1], -0.45, 0.45)
         projected = np.clip(projected, self.forward_action_low, self.forward_action_high)
         projected[0] = np.clip(projected[0], 0.0, 0.12)
         return projected.astype(np.float32)
+
+    def _baseline_action(self) -> np.ndarray:
+        assert self.reference is not None
+        assert self.state is not None
+        current_ref = self.reference.states[min(self.step_idx, len(self.reference.states) - 1)]
+        next_ref = self.reference.states[min(self.step_idx + 1, len(self.reference.states) - 1)]
+        dt = 0.05
+        if self.reference.times.shape[0] > 1:
+            idx = min(self.step_idx, self.reference.times.shape[0] - 2)
+            dt = max(float(self.reference.times[idx + 1] - self.reference.times[idx]), 1e-6)
+
+        yaw_deg = float(model_quat_to_carla_yaw_deg(self.state[3:7]))
+        yaw_rad = np.radians(yaw_deg)
+        cos_y = float(np.cos(yaw_rad))
+        sin_y = float(np.sin(yaw_rad))
+        target_vec = next_ref[:2] - self.state[:2]
+        forward_err = float(target_vec[0] * cos_y + target_vec[1] * sin_y)
+        lateral_err = float(-target_vec[0] * sin_y + target_vec[1] * cos_y)
+        yaw_target_deg = float(model_quat_to_carla_yaw_deg(next_ref[3:7]))
+        yaw_err_deg = float(wrap_angle_deg(yaw_target_deg - yaw_deg))
+        target_step = float(np.linalg.norm(next_ref[:2] - current_ref[:2]))
+        target_speed = target_step / dt
+
+        throttle = 0.04 + 0.42 * max(0.0, forward_err) + 0.02 * target_speed
+        if forward_err < -0.05:
+            throttle = 0.035
+        steer = 0.55 * lateral_err + 0.012 * yaw_err_deg
+        baseline = np.array([throttle, steer], dtype=np.float32)
+        baseline[0] = np.clip(baseline[0], 0.035, 0.10)
+        baseline[1] = np.clip(baseline[1], -0.30, 0.30)
+        return self._project_final_action(baseline)
+
+    def expert_action_to_policy_target(self, expert_action: np.ndarray) -> np.ndarray:
+        baseline = self._baseline_action()
+        residual = np.asarray(expert_action, dtype=np.float32) - baseline
+        return self._project_residual_action(residual)
 
     def _build_observation(self) -> np.ndarray:
         assert self.state is not None
@@ -208,6 +257,7 @@ class DTModelEnv(gym.Env):
         else:
             self.state = self._sample_initial_state(reference_trajectory.states[0])
         bootstrap_action = reference_trajectory.actions[0] if reference_trajectory.actions.shape[0] > 0 else np.zeros(2, dtype=np.float32)
+        bootstrap_action = self._project_final_action(bootstrap_action)
         bootstrap_model_history(self.history, self.state, bootstrap_action, self.seq_length)
 
         observation = self._build_observation()
@@ -224,7 +274,9 @@ class DTModelEnv(gym.Env):
 
         raw_action = np.asarray(action, dtype=np.float32).copy()
         ref_action = self._reference_action()
-        clipped_action = self._project_action(raw_action)
+        baseline_action = self._baseline_action()
+        clipped_residual = self._project_residual_action(raw_action)
+        clipped_action = self._project_final_action(baseline_action + clipped_residual)
         bundle = choose_bundle_for_action(clipped_action, self.forward_model, self.backward_model)
         history_np = self._history_array(clipped_action)
         predicted_delta = predict_delta_state(history_np, bundle, self.device)
@@ -244,6 +296,17 @@ class DTModelEnv(gym.Env):
             failure_position_threshold=self.env_config.failure_position_threshold,
             failure_yaw_threshold_deg=self.env_config.failure_yaw_threshold_deg,
         )
+        residual_ratio = np.array(
+            [
+                clipped_residual[0] / max(THROTTLE_RESIDUAL_LIMIT, 1e-6),
+                clipped_residual[1] / max(STEER_RESIDUAL_LIMIT, 1e-6),
+            ],
+            dtype=np.float32,
+        )
+        residual_penalty = float(self.residual_penalty_weight * np.mean(np.square(residual_ratio)))
+        reward_info["reward"] = float(reward_info["reward"] - residual_penalty)
+        reward_info["loss"] = float(reward_info["loss"] + residual_penalty)
+        reward_info["residual_penalty"] = residual_penalty
         self.cumulative_state_error_sum = reward_info["updated_cumulative_state_error_sum"].astype(np.float32)
 
         self.history.append(np.concatenate([self.state, clipped_action], axis=0).astype(np.float32))
@@ -269,6 +332,10 @@ class DTModelEnv(gym.Env):
             "reference_type": self.reference.metadata.get("type", "unknown"),
             "raw_action_throttle": float(raw_action[0]),
             "raw_action_steering": float(raw_action[1]),
+            "baseline_action_throttle": float(baseline_action[0]),
+            "baseline_action_steering": float(baseline_action[1]),
+            "residual_action_throttle": float(clipped_residual[0]),
+            "residual_action_steering": float(clipped_residual[1]),
             "applied_action_throttle": float(clipped_action[0]),
             "applied_action_steering": float(clipped_action[1]),
             "reference_action_throttle": float(ref_action[0]),

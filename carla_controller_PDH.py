@@ -6,6 +6,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -20,6 +21,8 @@ try:
     import carla
 except ImportError:
     carla = None
+
+from policy_network import SACAgent, SACConfig
 
 
 class QCarWorldModel(nn.Module):
@@ -123,6 +126,9 @@ class ActionEvaluation:
 class PredictionInfo:
     bundle_name: str
     action: np.ndarray
+    baseline_action: np.ndarray
+    raw_residual_action: np.ndarray
+    residual_action: np.ndarray
     delta_xy_body: np.ndarray
     delta_yaw: float
     predicted_delta: np.ndarray
@@ -665,6 +671,17 @@ def control_to_action(control: "carla.VehicleControl") -> np.ndarray:
     return np.array([throttle, steer], dtype=np.float32)
 
 
+def load_policy_agent(policy_path: Path, device: torch.device) -> SACAgent:
+    payload = torch.load(policy_path, map_location=device)
+    config = SACConfig(**payload["config"])
+    agent = SACAgent(config, device)
+    if "critic" in payload:
+        agent.load_state_dict(payload)
+    else:
+        agent.load_actor_state_dict(payload)
+    return agent
+
+
 class QCarVehicle:
     def __init__(
         self,
@@ -673,17 +690,51 @@ class QCarVehicle:
         backward_bundle: ModelBundle,
         fixed_delta: float,
         interpolation_alpha: float = 0.35,
+        policy_agent: Optional[SACAgent] = None,
+        policy_deterministic: bool = True,
+        use_rl_correction: bool = False,
+        correction_gain: float = 0.3,
     ) -> None:
         self.actor = actor
         self.forward_bundle = forward_bundle
         self.backward_bundle = backward_bundle
         self.fixed_delta = fixed_delta
         self.interpolation_alpha = float(np.clip(interpolation_alpha, 0.0, 1.0))
+        self.policy_agent = policy_agent
+        self.policy_deterministic = bool(policy_deterministic)
+        self.use_rl_correction = bool(use_rl_correction)
+        self.forward_throttle_correction_gain = 0.15
+        self.forward_steer_correction_gain = float(np.clip(correction_gain, 0.0, 1.0))
+        self.reverse_throttle_correction_gain = 0.0
+        self.reverse_steer_correction_gain = 0.0
+        self.forward_steer_trim = 0.0
+        self.reverse_steer_trim = 0.0
         self.seq_length = forward_bundle.normalizer.seq_length
         self.history: Deque[np.ndarray] = deque(maxlen=self.seq_length)
         self.model_state = extract_state_vector_from_vehicle(actor)
         self.last_prediction: Optional[PredictionInfo] = None
         self.last_yaw_delta_cmd = 0.0
+        self.prev_action: Optional[np.ndarray] = None
+        self.cumulative_state_error_sum = np.zeros(7, dtype=np.float32)
+        self.correction_steps = 0
+        self.state_scale = np.array([20.0, 20.0, 2.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.error_scale = np.array([5.0, 5.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.forward_action_low = np.array(
+            [max(0.0, float(self.forward_bundle.normalizer.x_mean[7] - 3.0 * self.forward_bundle.normalizer.x_std[7])), -0.45],
+            dtype=np.float32,
+        )
+        self.forward_action_high = np.array(
+            [min(0.20, float(self.forward_bundle.normalizer.x_mean[7] + 3.0 * self.forward_bundle.normalizer.x_std[7])), 0.45],
+            dtype=np.float32,
+        )
+        self.backward_action_low = np.array(
+            [max(-0.20, float(self.backward_bundle.normalizer.x_mean[7] - 3.0 * self.backward_bundle.normalizer.x_std[7])), -0.45],
+            dtype=np.float32,
+        )
+        self.backward_action_high = np.array(
+            [min(0.0, float(self.backward_bundle.normalizer.x_mean[7] + 3.0 * self.backward_bundle.normalizer.x_std[7])), 0.45],
+            dtype=np.float32,
+        )
         bootstrap_model_history(
             self.history,
             self.model_state,
@@ -703,12 +754,108 @@ class QCarVehicle:
         self.model_state = extract_state_vector_from_vehicle(self.actor)
         self.last_prediction = None
         self.last_yaw_delta_cmd = 0.0
+        self.prev_action = None
+        self.cumulative_state_error_sum = np.zeros(7, dtype=np.float32)
+        self.correction_steps = 0
         bootstrap_model_history(
             self.history,
             self.model_state,
             np.array([0.0, 0.0], dtype=np.float32),
             self.seq_length,
         )
+
+    def set_rl_correction_enabled(self, enabled: bool) -> None:
+        self.use_rl_correction = bool(enabled)
+
+    def set_correction_gain(self, gain: float) -> None:
+        self.forward_steer_correction_gain = float(np.clip(gain, 0.0, 1.0))
+
+    def get_correction_gain(self) -> float:
+        return float(self.forward_steer_correction_gain)
+
+    def adjust_steer_trim(self, forward: bool, delta: float) -> float:
+        if forward:
+            self.forward_steer_trim = float(np.clip(self.forward_steer_trim + delta, -0.20, 0.20))
+            return self.forward_steer_trim
+        self.reverse_steer_trim = float(np.clip(self.reverse_steer_trim + delta, -0.20, 0.20))
+        return self.reverse_steer_trim
+
+    def _clip_action_for_dt(self, action: np.ndarray) -> np.ndarray:
+        clipped = np.asarray(action, dtype=np.float32).copy()
+        if clipped[0] >= 0.0:
+            clipped = np.clip(clipped, self.forward_action_low, self.forward_action_high)
+        else:
+            clipped = np.clip(clipped, self.backward_action_low, self.backward_action_high)
+        return clipped.astype(np.float32)
+
+    def _normalize_vector(self, values: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        normalized = np.asarray(values, dtype=np.float32) / np.asarray(scales, dtype=np.float32)
+        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+
+    def _normalize_action(self, action: np.ndarray) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32)
+        return np.array(
+            [
+                np.clip((action[0] / 0.12) * 2.0 - 1.0, -1.0, 1.0),
+                np.clip(action[1] / 0.45, -1.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
+
+    def _history_array(self, current_state: np.ndarray, action: np.ndarray, seq_length: int) -> np.ndarray:
+        feature = np.concatenate([current_state, action], axis=0).astype(np.float32)
+        temp_history = deque(self.history, maxlen=seq_length)
+        temp_history.append(feature.copy())
+        while len(temp_history) < seq_length:
+            temp_history.appendleft(feature.copy())
+        return np.stack(list(temp_history), axis=0).astype(np.float32)
+
+    def _build_policy_observation(self, current_state: np.ndarray, target_state: np.ndarray) -> np.ndarray:
+        tracking_error = current_state - target_state
+        prev_action = self.prev_action if self.prev_action is not None else np.zeros(2, dtype=np.float32)
+        current_loss = float(np.mean(np.square(tracking_error)))
+        history_steps = max(1, self.correction_steps)
+        cumulative_mean_loss = (
+            float(np.mean(self.cumulative_state_error_sum / float(history_steps)))
+            if self.correction_steps > 0
+            else current_loss
+        )
+        yaw_error_deg = float(
+            wrap_angle_deg(
+                model_quat_to_carla_yaw_deg(current_state[3:7]) - model_quat_to_carla_yaw_deg(target_state[3:7])
+            )
+        )
+        return np.concatenate(
+            [
+                self._normalize_vector(current_state, self.state_scale),
+                self._normalize_vector(target_state, self.state_scale),
+                self._normalize_vector(tracking_error, self.error_scale),
+                self._normalize_action(prev_action),
+                np.array(
+                    [
+                        np.clip(cumulative_mean_loss / 4.0, -1.0, 1.0),
+                        np.clip(current_loss / 4.0, -1.0, 1.0),
+                        np.clip(yaw_error_deg / 30.0, -1.0, 1.0),
+                    ],
+                    dtype=np.float32,
+                ),
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+    def _build_straight_target_state(
+        self,
+        current_state: np.ndarray,
+        baseline_predicted_output: np.ndarray,
+    ) -> np.ndarray:
+        straight_delta = np.asarray(baseline_predicted_output, dtype=np.float32).copy()
+        straight_delta[1] = 0.0
+        straight_delta[3] = 0.0
+        target_state = current_state.copy().astype(np.float32)
+        world_delta = body_delta_to_world_state_delta(current_state, straight_delta[:3])
+        target_state[:3] = current_state[:3] + world_delta[:3]
+        target_state[3:7] = current_state[3:7].copy()
+        return normalize_quaternion_in_state(target_state)
 
     def _stabilize_predicted_output(self, bundle_name: str, action: np.ndarray, predicted_output: np.ndarray) -> np.ndarray:
         stabilized = predicted_output.astype(np.float32, copy=True)
@@ -733,26 +880,78 @@ class QCarVehicle:
         return stabilized
 
     def apply_control(self, control: "carla.VehicleControl", device: torch.device) -> None:
-        action = control_to_action(control)
-        bundle = choose_bundle_for_action(action, self.forward_bundle, self.backward_bundle)
-
+        baseline_action = control_to_action(control)
+        if baseline_action[0] >= 0.0:
+            baseline_action[1] = float(np.clip(baseline_action[1] + self.forward_steer_trim, -0.45, 0.45))
+        else:
+            baseline_action[1] = float(np.clip(baseline_action[1] + self.reverse_steer_trim, -0.45, 0.45))
+        baseline_action = self._clip_action_for_dt(baseline_action)
         current_state = self.model_state.copy()
         self.model_state = current_state
+        baseline_bundle = choose_bundle_for_action(baseline_action, self.forward_bundle, self.backward_bundle)
+        baseline_hist_np = self._history_array(current_state, baseline_action, baseline_bundle.normalizer.seq_length)
+        baseline_predicted_output_raw = predict_delta_state(baseline_hist_np, baseline_bundle, device)
+        baseline_predicted_output = self._stabilize_predicted_output(
+            baseline_bundle.name,
+            baseline_action,
+            baseline_predicted_output_raw,
+        )
+        target_state = self._build_straight_target_state(current_state, baseline_predicted_output)
 
-        history_copy = deque(self.history, maxlen=bundle.normalizer.seq_length)
-        feature = np.concatenate([current_state, action], axis=0).astype(np.float32)
-        history_copy.append(feature.copy())
-        while len(history_copy) < bundle.normalizer.seq_length:
-            history_copy.appendleft(feature.copy())
+        raw_residual_action = np.zeros(2, dtype=np.float32)
+        residual_action = np.zeros(2, dtype=np.float32)
+        action = baseline_action.copy()
+        if self.use_rl_correction and self.policy_agent is not None:
+            observation = self._build_policy_observation(current_state, target_state)
+            raw_residual_action = self.policy_agent.select_action(
+                observation,
+                deterministic=self.policy_deterministic,
+            ).astype(np.float32)
+            raw_residual_action = np.array(
+                [
+                    float(np.clip(raw_residual_action[0], -0.06, 0.06)),
+                    float(np.clip(raw_residual_action[1], -0.25, 0.25)),
+                ],
+                dtype=np.float32,
+            )
+            if baseline_action[0] >= 0.0:
+                throttle_gain = self.forward_throttle_correction_gain
+                steer_gain = self.forward_steer_correction_gain
+            else:
+                throttle_gain = self.reverse_throttle_correction_gain
+                steer_gain = self.reverse_steer_correction_gain
+            residual_action = np.array(
+                [
+                    float(throttle_gain * raw_residual_action[0]),
+                    float(steer_gain * raw_residual_action[1]),
+                ],
+                dtype=np.float32,
+            )
+            action = self._clip_action_for_dt(baseline_action + residual_action)
 
-        hist_np = np.stack(list(history_copy), axis=0).astype(np.float32)
+        bundle = choose_bundle_for_action(action, self.forward_bundle, self.backward_bundle)
+        hist_np = self._history_array(current_state, action, bundle.normalizer.seq_length)
         predicted_output_raw = predict_delta_state(hist_np, bundle, device)
         predicted_output = self._stabilize_predicted_output(bundle.name, action, predicted_output_raw)
         next_state = predicted_output_to_next_state(current_state, predicted_output)
 
-        self._apply_model_state_transition(current_state, next_state, bundle.name, action, predicted_output, predicted_output_raw)
+        self._apply_model_state_transition(
+            current_state,
+            next_state,
+            bundle.name,
+            action,
+            baseline_action,
+            raw_residual_action,
+            residual_action,
+            predicted_output,
+            predicted_output_raw,
+        )
         self.model_state = next_state.copy()
         self.history.append(np.concatenate([self.model_state, action], axis=0).astype(np.float32))
+        self.prev_action = action.copy()
+        tracking_error = next_state - target_state
+        self.cumulative_state_error_sum += np.square(tracking_error).astype(np.float32)
+        self.correction_steps += 1
 
     def _apply_model_state_transition(
         self,
@@ -760,6 +959,9 @@ class QCarVehicle:
         next_model_state: np.ndarray,
         bundle_name: str,
         action: np.ndarray,
+        baseline_action: np.ndarray,
+        raw_residual_action: np.ndarray,
+        residual_action: np.ndarray,
         predicted_delta: np.ndarray,
         predicted_delta_raw: np.ndarray,
     ) -> None:
@@ -791,6 +993,9 @@ class QCarVehicle:
         self.last_prediction = PredictionInfo(
             bundle_name=bundle_name,
             action=action.copy(),
+            baseline_action=baseline_action.copy(),
+            raw_residual_action=raw_residual_action.copy(),
+            residual_action=residual_action.copy(),
             delta_xy_body=np.array([dx_world, dy_world], dtype=np.float32),
             delta_yaw=delta_yaw,
             predicted_delta=predicted_delta.copy(),
@@ -801,9 +1006,14 @@ class QCarVehicle:
 
 VK_W = 0x57
 VK_A = 0x41
+VK_X = 0x58
+VK_Z = 0x5A
 VK_S = 0x53
 VK_D = 0x44
+VK_C = 0x43
+VK_E = 0x45
 VK_SPACE = 0x20
+VK_Q = 0x51
 VK_R = 0x52
 VK_ESC = 0x1B
 
@@ -817,9 +1027,14 @@ class EdgeKeyReader:
         self.prev = {
             VK_W: False,
             VK_A: False,
+            VK_X: False,
+            VK_Z: False,
             VK_S: False,
             VK_D: False,
+            VK_C: False,
+            VK_E: False,
             VK_SPACE: False,
+            VK_Q: False,
             VK_R: False,
             VK_ESC: False,
         }
@@ -872,6 +1087,10 @@ def build_mode_name(throttle_cmd: float, steer_cmd: float) -> str:
     return throttle_name if steer_name == "STRAIGHT" else f"{throttle_name}_{steer_name}"
 
 
+def is_forward_mode(throttle_cmd: float) -> bool:
+    return float(throttle_cmd) >= 0.0
+
+
 def main() -> None:
     ensure_carla_available()
     ensure_pygame_available()
@@ -902,11 +1121,18 @@ def main() -> None:
         default=os.path.join(project_root, "PDHModel", "backward_normalization.pt"),
     )
     parser.add_argument("--interpolation-alpha", type=float, default=0.35)
+    parser.add_argument(
+        "--policy-path",
+        default=os.path.join(project_root, "PDHModel", "spec_rl_resampled_fix1", "policy_controller.pth"),
+    )
+    parser.add_argument("--policy-stochastic", action="store_true")
+    parser.add_argument("--correction-gain", type=float, default=0.6)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     forward_bundle = load_bundle("forward", args.forward_model_path, args.forward_norm_path, device)
     backward_bundle = load_bundle("backward", args.backward_model_path, args.backward_norm_path, device)
+    policy_agent = load_policy_agent(Path(args.policy_path), device) if args.policy_path else None
 
     if forward_bundle.normalizer.seq_length != backward_bundle.normalizer.seq_length:
         raise ValueError("Forward and backward models use different seq_length values")
@@ -932,6 +1158,8 @@ def main() -> None:
     current_control = build_vehicle_control(throttle_cmd, steer_cmd)
     camera_state: Optional[CameraState] = None
     control_active = False
+    use_rl_correction = False
+    correction_gain = float(np.clip(args.correction_gain, 0.0, 1.0))
 
     try:
         settings = world.get_settings()
@@ -948,6 +1176,10 @@ def main() -> None:
             backward_bundle=backward_bundle,
             fixed_delta=args.fixed_delta,
             interpolation_alpha=args.interpolation_alpha,
+            policy_agent=policy_agent,
+            policy_deterministic=not args.policy_stochastic,
+            use_rl_correction=use_rl_correction,
+            correction_gain=correction_gain,
         )
 
         world.tick()
@@ -963,11 +1195,25 @@ def main() -> None:
         print("carla_controller_PDH started")
         print(f"Forward model: {args.forward_model_path}")
         print(f"Backward model: {args.backward_model_path}")
+        print(f"Policy: {args.policy_path if policy_agent is not None else 'DISABLED'}")
         print(f"Interpolation alpha: {args.interpolation_alpha:.2f}")
+        print(
+            f"Forward steer correction gain: {correction_gain:.2f} | "
+            f"Forward throttle correction gain: {qcar_vehicle.forward_throttle_correction_gain:.2f}"
+        )
+        print(
+            f"Reverse steer correction gain: {qcar_vehicle.reverse_steer_correction_gain:.2f} | "
+            f"Reverse throttle correction gain: {qcar_vehicle.reverse_throttle_correction_gain:.2f}"
+        )
+        print(
+            f"Forward steer trim: {qcar_vehicle.forward_steer_trim:+.3f} | "
+            f"Reverse steer trim: {qcar_vehicle.reverse_steer_trim:+.3f}"
+        )
         print("Quaternion control: model-owned pose updates with interpolation only")
         print("QCarVehicle.apply_control() now applies the model target pose directly.")
+        print(f"RL correction default: {'ON' if use_rl_correction else 'OFF'} (Q to toggle)")
         print("W: forward | S: reverse | Space: idle | A: toggle left steer | D: toggle right steer")
-        print("R: reset | ESC: quit")
+        print("Q: toggle RL correction | E/C: gain +/- | Z/X: trim -/+ (current dir) | R: reset | ESC: quit")
         print("=" * 80)
 
         while True:
@@ -1007,6 +1253,29 @@ def main() -> None:
                 control_active = False
                 qcar_vehicle.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
                 print(f"[control] {current_mode}")
+            elif key_reader.just_pressed(VK_Q):
+                if policy_agent is None:
+                    print("[control] RL correction unavailable: policy not loaded")
+                else:
+                    use_rl_correction = not use_rl_correction
+                    qcar_vehicle.set_rl_correction_enabled(use_rl_correction)
+                    print(f"[control] RL correction {'ON' if use_rl_correction else 'OFF'}")
+            elif key_reader.just_pressed(VK_E):
+                correction_gain = float(np.clip(correction_gain + 0.05, 0.0, 1.0))
+                qcar_vehicle.set_correction_gain(correction_gain)
+                print(f"[control] Forward steer correction gain {correction_gain:.2f}")
+            elif key_reader.just_pressed(VK_C):
+                correction_gain = float(np.clip(correction_gain - 0.05, 0.0, 1.0))
+                qcar_vehicle.set_correction_gain(correction_gain)
+                print(f"[control] Forward steer correction gain {correction_gain:.2f}")
+            elif key_reader.just_pressed(VK_Z):
+                forward = is_forward_mode(throttle_cmd)
+                trim = qcar_vehicle.adjust_steer_trim(forward=forward, delta=-0.01)
+                print(f"[control] {'Forward' if forward else 'Reverse'} steer trim {trim:+.3f}")
+            elif key_reader.just_pressed(VK_X):
+                forward = is_forward_mode(throttle_cmd)
+                trim = qcar_vehicle.adjust_steer_trim(forward=forward, delta=+0.01)
+                print(f"[control] {'Forward' if forward else 'Reverse'} steer trim {trim:+.3f}")
             elif key_reader.just_pressed(VK_R):
                 throttle_cmd = 0.0
                 steer_cmd = 0.0
@@ -1023,6 +1292,7 @@ def main() -> None:
             else:
                 qcar_vehicle.actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
                 qcar_vehicle.model_state = extract_state_vector_from_vehicle(qcar_vehicle.actor)
+                qcar_vehicle.last_prediction = None
 
             world.tick()
             frame_count += 1
@@ -1041,9 +1311,24 @@ def main() -> None:
                     "frame": frame_count,
                     "time": frame_count * args.fixed_delta,
                     "mode": current_mode,
+                    "rl_correction_enabled": int(use_rl_correction),
+                    "forward_steer_correction_gain": float(correction_gain),
+                    "forward_throttle_correction_gain": float(qcar_vehicle.forward_throttle_correction_gain),
+                    "reverse_steer_correction_gain": float(qcar_vehicle.reverse_steer_correction_gain),
+                    "reverse_throttle_correction_gain": float(qcar_vehicle.reverse_throttle_correction_gain),
+                    "forward_steer_trim": float(qcar_vehicle.forward_steer_trim),
+                    "reverse_steer_trim": float(qcar_vehicle.reverse_steer_trim),
                     "selected_model": "" if pred is None else pred.bundle_name,
-                    "action_throttle": float(action[0]),
-                    "action_steer": float(action[1]),
+                    "input_throttle": float(action[0]),
+                    "input_steer": float(action[1]),
+                    "baseline_throttle": float(action[0]) if pred is None else float(pred.baseline_action[0]),
+                    "baseline_steer": float(action[1]) if pred is None else float(pred.baseline_action[1]),
+                    "raw_residual_throttle": 0.0 if pred is None else float(pred.raw_residual_action[0]),
+                    "raw_residual_steer": 0.0 if pred is None else float(pred.raw_residual_action[1]),
+                    "residual_throttle": 0.0 if pred is None else float(pred.residual_action[0]),
+                    "residual_steer": 0.0 if pred is None else float(pred.residual_action[1]),
+                    "action_throttle": float(action[0]) if pred is None else float(pred.action[0]),
+                    "action_steer": float(action[1]) if pred is None else float(pred.action[1]),
                     "carla_pos_x": tf.location.x,
                     "carla_pos_y": tf.location.y,
                     "carla_pos_z": tf.location.z,
@@ -1071,6 +1356,8 @@ def main() -> None:
 
             lines = [
                 f"Mode: {current_mode}",
+                f"RL correction: {'ON' if use_rl_correction else 'OFF'} | fwd_steer_gain={correction_gain:.2f} | rev_steer_gain={qcar_vehicle.reverse_steer_correction_gain:.2f}",
+                f"Steer trim: fwd={qcar_vehicle.forward_steer_trim:+.3f} | rev={qcar_vehicle.reverse_steer_trim:+.3f}",
                 f"apply_control input: throttle={action[0]:.3f}, steer={action[1]:.3f}",
                 "World model: " + ("-" if pred is None else pred.bundle_name),
                 f"Vehicle pos: x={tf.location.x:.3f}, y={tf.location.y:.3f}, z={tf.location.z:.3f}",
@@ -1078,15 +1365,19 @@ def main() -> None:
                 format_vector("CARLA state7", carla_state),
                 f"Model pos: x={model_state[0]:.3f}, y={model_state[1]:.3f}, z={model_state[2]:.3f}",
                 format_vector("Model state7", model_state),
-                "W forward | S reverse | A toggle left | D toggle right | Space idle | R reset | ESC quit",
+                "W forward | S reverse | A toggle left | D toggle right | Space idle | Q RL | E/C gain | Z/X trim | R reset | ESC quit",
             ]
 
             if pred is not None:
                 lines.insert(
                     3,
+                    f"Applied action: baseline=({pred.baseline_action[0]:+.3f},{pred.baseline_action[1]:+.3f}) raw_residual=({pred.raw_residual_action[0]:+.3f},{pred.raw_residual_action[1]:+.3f}) scaled_residual=({pred.residual_action[0]:+.3f},{pred.residual_action[1]:+.3f}) final=({pred.action[0]:+.3f},{pred.action[1]:+.3f})",
+                )
+                lines.insert(
+                    4,
                     f"Applied world dx={pred.delta_xy_body[0]:.4f}, dy={pred.delta_xy_body[1]:.4f}, yaw_delta={pred.delta_yaw:.3f}, raw_yaw_delta={pred.yaw_delta_raw:.3f}, suppressed={pred.yaw_jump_suppressed}",
                 )
-                lines.insert(7, format_vector("Pred delta7", pred.predicted_delta))
+                lines.insert(8, format_vector("Pred delta7", pred.predicted_delta))
 
             screen.fill((20, 20, 20))
             y = 12

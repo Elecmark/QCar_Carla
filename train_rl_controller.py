@@ -251,10 +251,11 @@ def collect_bc_batch(env: DTModelEnv, trajectory: ReferenceTrajectory) -> Tuple[
     obs, _ = env.reset(reference_trajectory=trajectory, initial_state=trajectory.states[0].copy())
     horizon = min(len(trajectory.actions), env.env_config.max_steps)
     for step in range(horizon):
-        action = env._project_action(trajectory.actions[step])
+        expert_action = env._project_final_action(trajectory.actions[step])
+        policy_target = env.expert_action_to_policy_target(expert_action)
         observations.append(obs.copy())
-        actions.append(action)
-        obs, _, terminated, truncated, _ = env.step(action)
+        actions.append(policy_target)
+        obs, _, terminated, truncated, _ = env.step(policy_target)
         if terminated or truncated:
             break
     return torch.from_numpy(np.asarray(observations, dtype=np.float32)), torch.from_numpy(np.asarray(actions, dtype=np.float32))
@@ -344,8 +345,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixed-delta", type=float, default=0.05)
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--data-root", type=Path, default=Path("PDHModel/reference_trajectories"))
-    parser.add_argument("--output-dir", type=Path, default=Path("PDHModel"))
+    parser.add_argument("--data-root", type=Path, default=Path("QCarDataSet"))
+    parser.add_argument("--output-dir", type=Path, default=Path("PDHModel/rl_qcardataset"))
     parser.add_argument("--forward-model-path", type=Path, default=Path("PDHModel/forward_world_model.pth"))
     parser.add_argument("--forward-norm-path", type=Path, default=Path("PDHModel/forward_normalization.pt"))
     parser.add_argument("--backward-model-path", type=Path, default=Path("PDHModel/backward_world_model.pth"))
@@ -416,7 +417,9 @@ def main() -> None:
 
         while not (done or truncated):
             if total_steps < args.start_random_steps:
-                action = np.random.uniform(-1.0, 1.0, size=(action_dim,)).astype(np.float32)
+                low = env.action_space.low.astype(np.float32)
+                high = env.action_space.high.astype(np.float32)
+                action = np.random.uniform(low, high).astype(np.float32)
             else:
                 action = agent.select_action(observation, deterministic=False).astype(np.float32)
 

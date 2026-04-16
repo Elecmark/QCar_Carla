@@ -16,7 +16,7 @@ from policy_network import SACAgent, SACConfig
 from reference_generator import (
     ReferenceTrajectory,
     generate_reference_trajectory,
-    load_reference_trajectory_from_csv,
+    load_reference_trajectory_for_dt,
     sample_follow_trajectory,
 )
 
@@ -104,11 +104,30 @@ def sample_generated_trajectory(ref_type: str, length: int, rng: random.Random) 
     return generate_reference_trajectory(ref_type, length, params=params)
 
 
-def choose_reference_trajectory(args: argparse.Namespace, rng: random.Random, data_root: Path) -> ReferenceTrajectory:
+def choose_reference_trajectory(
+    args: argparse.Namespace,
+    rng: random.Random,
+    data_root: Path,
+    forward_bundle,
+    device: torch.device,
+) -> ReferenceTrajectory:
     if args.reference_csv is not None:
-        return load_reference_trajectory_from_csv(args.reference_csv, max_length=args.max_steps + 1)
+        return load_reference_trajectory_for_dt(
+            args.reference_csv,
+            forward_bundle,
+            device,
+            control_dt=args.fixed_delta,
+            max_length=args.max_steps + 1,
+        )
     if args.follow_probability > 0.0 and rng.random() < args.follow_probability:
-        return sample_follow_trajectory(data_root, args.max_steps + 1, rng)
+        return sample_follow_trajectory(
+            data_root,
+            args.max_steps + 1,
+            rng,
+            forward_bundle=forward_bundle,
+            device=device,
+            control_dt=args.fixed_delta,
+        )
     return sample_generated_trajectory(args.ref_type, args.max_steps + 1, rng)
 
 
@@ -118,12 +137,8 @@ def collect_supervised_batch(env: DTModelEnv, trajectory: ReferenceTrajectory) -
     obs, _ = env.reset(reference_trajectory=trajectory)
     horizon = min(len(trajectory.actions), env.env_config.max_steps)
     for step in range(horizon):
-        action = trajectory.actions[step].astype(np.float32, copy=True)
-        if action[0] >= 0.0:
-            action[0] = np.clip(action[0], 0.0, 1.0)
-        else:
-            action[0] = np.clip(action[0], -1.0, 0.0)
-        action[1] = np.clip(action[1], -1.0, 1.0)
+        expert_action = trajectory.actions[step].astype(np.float32, copy=True)
+        action = env.expert_action_to_policy_target(expert_action)
         observations.append(obs.copy())
         actions.append(action.copy())
         obs, _, terminated, truncated, _ = env.step(action)
@@ -152,8 +167,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref-type", default="mixed", choices=["mixed", "straight", "circle", "figure8", "sine", "s_curve"])
     parser.add_argument("--reference-csv", type=Path)
     parser.add_argument("--follow-probability", type=float, default=1.0)
-    parser.add_argument("--data-root", type=Path, default=Path("PDHModel/reference_trajectories"))
-    parser.add_argument("--output-dir", type=Path, default=Path("PDHModel/il_controller"))
+    parser.add_argument("--fixed-delta", type=float, default=0.05)
+    parser.add_argument("--data-root", type=Path, default=Path("QCarDataSet"))
+    parser.add_argument("--output-dir", type=Path, default=Path("PDHModel/il_controller_qcardataset"))
     parser.add_argument("--forward-model-path", type=Path, default=Path("PDHModel/forward_world_model.pth"))
     parser.add_argument("--forward-norm-path", type=Path, default=Path("PDHModel/forward_normalization.pt"))
     parser.add_argument("--backward-model-path", type=Path, default=Path("PDHModel/backward_world_model.pth"))
@@ -187,7 +203,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         epoch_losses = []
         for batch_idx in range(args.batches_per_epoch):
-            trajectory = choose_reference_trajectory(args, rng, project_root / args.data_root)
+            trajectory = choose_reference_trajectory(args, rng, project_root / args.data_root, forward_bundle, device)
             observations, actions = collect_supervised_batch(env, trajectory)
             if len(observations) == 0:
                 continue
