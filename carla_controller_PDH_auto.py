@@ -67,7 +67,38 @@ VK_LEFT = 0x25
 VK_RIGHT = 0x27
 VK_ESC = 0x1B
 USE_RL_CORRECTION_DEFAULT = True
+CARLA_MAP_OVERRIDE: Optional[str] = None
+# Example values:
+# Town01
+# Town01_Opt
+# Town02
+# Town02_Opt
+# Town03
+# Town03_Opt
+# Town04
+# Town04_Opt
+# Town05
+# Town05_Opt
+# Town06
+# Town06_Opt
+# Town07
+# Town07_Opt
+# Town10HD
+# Town10HD_Opt
+# Town11
+# Town12
+# Town13
+# Town15
+# AnnotationColorLandscape
 
+
+# CARLA_MAP_OVERRIDE = "Town10_Opt"
+CARLA_FLAT_TEST_SCENE = False
+FLAT_TEST_SCENE_LENGTH_METERS = 240.0
+FLAT_TEST_SCENE_HALF_WIDTH_METERS = 120.0
+FLAT_TEST_GRID_SPACING_METERS = 5.0
+FLAT_TEST_GRID_HALF_SIZE_METERS = 120.0
+FLAT_TEST_GRID_MAJOR_EVERY = 5
 
 @dataclass
 class ReferenceFrame:
@@ -103,6 +134,214 @@ def ensure_carla_available() -> None:
 def ensure_pygame_available() -> None:
     if pygame is None:
         raise RuntimeError("Failed to import pygame. Install pygame in the current environment first.")
+
+
+def normalize_carla_map_name(map_name: Optional[str]) -> Optional[str]:
+    if not map_name:
+        return None
+    normalized = map_name.strip().replace("\\", "/")
+    return normalized or None
+
+
+def build_carla_map_candidates(map_name: str) -> List[str]:
+    normalized = map_name.strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return []
+
+    candidates: List[str] = []
+
+    def add(candidate: str) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(normalized)
+    if normalized.startswith("/Game/"):
+        add(normalized.removeprefix("/Game/"))
+    if normalized.startswith("Carla/Maps/"):
+        add(normalized.removeprefix("Carla/Maps/"))
+    if not normalized.startswith("/Game/"):
+        add(f"/Game/{normalized}")
+    if not normalized.startswith("Carla/Maps/"):
+        add(f"Carla/Maps/{normalized}")
+        add(f"/Game/Carla/Maps/{normalized}")
+
+    tail = normalized.split("/")[-1]
+    if "/" not in normalized:
+        add(f"{normalized}/{tail}")
+        add(f"Carla/Maps/{normalized}/{tail}")
+        add(f"/Game/Carla/Maps/{normalized}/{tail}")
+
+    return candidates
+
+
+def resolve_carla_map_name(client: "carla.Client", map_name: Optional[str]) -> Optional[str]:
+    normalized = normalize_carla_map_name(map_name)
+    if not normalized:
+        return None
+
+    available_maps = [item.replace("\\", "/") for item in client.get_available_maps()]
+    available_map_set = set(available_maps)
+    candidate_list = build_carla_map_candidates(normalized)
+
+    for candidate in candidate_list:
+        if candidate in available_map_set:
+            return candidate
+
+    candidate_suffixes = {candidate.removeprefix("/Game/") for candidate in candidate_list}
+    for available_map in available_maps:
+        suffix = available_map.removeprefix("/Game/")
+        if suffix in candidate_suffixes:
+            return available_map
+
+    for available_map in available_maps:
+        leaf = available_map.split("/")[-1]
+        parent = available_map.split("/")[-2] if "/" in available_map else ""
+        if normalized in {leaf, f"{parent}/{leaf}"}:
+            return available_map
+
+    raise ValueError(
+        f"Unknown CARLA map override: {map_name}. "
+        f"Examples: Town07, Town10HD_Opt, Town11/Town11, /Game/Carla/Maps/Town11/Town11"
+    )
+
+
+def choose_fallback_carla_map(client: "carla.Client") -> Optional[str]:
+    preferred_maps = ("Town10HD_Opt", "Town10HD", "Town07_Opt", "Town07", "Town01_Opt", "Town01")
+    available_maps = [item.replace("\\", "/") for item in client.get_available_maps()]
+    available_leaf_to_full = {item.split("/")[-1]: item for item in available_maps}
+    for preferred_map in preferred_maps:
+        if preferred_map in available_leaf_to_full:
+            return available_leaf_to_full[preferred_map]
+    return available_maps[0] if available_maps else None
+
+
+def build_flat_test_scene_xodr(length_m: float) -> str:
+    return f"""<?xml version="1.0" standalone="yes"?>
+<OpenDRIVE>
+  <header revMajor="1" revMinor="4" name="flat_test_scene" version="1.00" north="0" south="0" east="0" west="0" vendor="OpenAI"/>
+  <road name="FlatRoad" length="{length_m:.3f}" id="1" junction="-1">
+    <link/>
+    <planView>
+      <geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="{length_m:.3f}">
+        <line/>
+      </geometry>
+    </planView>
+    <elevationProfile>
+      <elevation s="0.0" a="0.0" b="0.0" c="0.0" d="0.0"/>
+    </elevationProfile>
+    <lanes>
+      <laneOffset s="0.0" a="0.0" b="0.0" c="0.0" d="0.0"/>
+      <laneSection s="0.0">
+        <left>
+          <lane id="1" type="driving" level="false">
+            <link/>
+            <width sOffset="0.0" a="4.0" b="0.0" c="0.0" d="0.0"/>
+            <roadMark sOffset="0.0" type="none" weight="standard" color="standard" width="0.0" laneChange="both"/>
+          </lane>
+        </left>
+        <center>
+          <lane id="0" type="none" level="false">
+            <link/>
+            <roadMark sOffset="0.0" type="none" weight="standard" color="standard" width="0.0" laneChange="both"/>
+          </lane>
+        </center>
+        <right>
+          <lane id="-1" type="driving" level="false">
+            <link/>
+            <width sOffset="0.0" a="4.0" b="0.0" c="0.0" d="0.0"/>
+            <roadMark sOffset="0.0" type="none" weight="standard" color="standard" width="0.0" laneChange="both"/>
+          </lane>
+        </right>
+      </laneSection>
+    </lanes>
+  </road>
+</OpenDRIVE>
+"""
+
+
+def load_flat_test_scene_world(client: "carla.Client") -> "carla.World":
+    params = carla.OpendriveGenerationParameters()
+    params.vertex_distance = 2.0
+    params.max_road_length = 50.0
+    params.wall_height = 0.0
+    params.additional_width = float(FLAT_TEST_SCENE_HALF_WIDTH_METERS)
+    params.smooth_junctions = True
+    params.enable_mesh_visibility = True
+    params.enable_pedestrian_navigation = False
+    xodr = build_flat_test_scene_xodr(float(FLAT_TEST_SCENE_LENGTH_METERS))
+    world = client.generate_opendrive_world(xodr, params)
+    world.set_weather(carla.WeatherParameters.ClearNoon)
+    return world
+
+
+def choose_flat_test_spawn_transform() -> "carla.Transform":
+    return carla.Transform(
+        carla.Location(
+            x=float(FLAT_TEST_SCENE_LENGTH_METERS * 0.5),
+            y=0.0,
+            z=0.5,
+        ),
+        carla.Rotation(yaw=0.0),
+    )
+
+
+def get_flat_test_scene_center_location() -> "carla.Location":
+    return carla.Location(
+        x=float(FLAT_TEST_SCENE_LENGTH_METERS * 0.5),
+        y=0.0,
+        z=0.0,
+    )
+
+
+def draw_flat_test_scene_grid(
+    world: "carla.World",
+    center: "carla.Location",
+    half_size_m: float = FLAT_TEST_GRID_HALF_SIZE_METERS,
+    spacing_m: float = FLAT_TEST_GRID_SPACING_METERS,
+) -> None:
+    if carla is None:
+        return
+    debug = world.debug
+    life_time = 2.0
+    z = float(center.z + 0.06)
+    minor_color = carla.Color(r=85, g=85, b=85)
+    major_color = carla.Color(r=120, g=120, b=120)
+    x_axis_color = carla.Color(r=120, g=80, b=80)
+    y_axis_color = carla.Color(r=80, g=120, b=95)
+
+    x_min = float(center.x - half_size_m)
+    x_max = float(center.x + half_size_m)
+    y_min = float(center.y - half_size_m)
+    y_max = float(center.y + half_size_m)
+
+    major_every = max(1, int(FLAT_TEST_GRID_MAJOR_EVERY))
+    x_value = x_min
+    while x_value <= x_max + 1e-6:
+        offset_steps = round((x_value - float(center.x)) / spacing_m)
+        is_axis = abs(x_value - float(center.x)) <= spacing_m * 0.25
+        is_major = (abs(offset_steps) % major_every) == 0
+        debug.draw_line(
+            carla.Location(x=x_value, y=y_min, z=z),
+            carla.Location(x=x_value, y=y_max, z=z),
+            thickness=0.035 if is_axis else (0.025 if is_major else 0.012),
+            color=y_axis_color if is_axis else (major_color if is_major else minor_color),
+            life_time=life_time,
+        )
+        x_value += spacing_m
+
+    y_value = y_min
+    while y_value <= y_max + 1e-6:
+        offset_steps = round((y_value - float(center.y)) / spacing_m)
+        is_axis = abs(y_value - float(center.y)) <= spacing_m * 0.25
+        is_major = (abs(offset_steps) % major_every) == 0
+        debug.draw_line(
+            carla.Location(x=x_min, y=y_value, z=z),
+            carla.Location(x=x_max, y=y_value, z=z),
+            thickness=0.035 if is_axis else (0.025 if is_major else 0.012),
+            color=x_axis_color if is_axis else (major_color if is_major else minor_color),
+            life_time=life_time,
+        )
+        y_value += spacing_m
 
 
 class EdgeKeyReader:
@@ -979,20 +1218,47 @@ def main() -> None:
     key_reader = EdgeKeyReader()
     paused = False
     spawn_transform = None
+    flat_scene_active = False
 
     try:
         if not args.no_carla:
             ensure_carla_available()
             client = carla.Client(args.host, args.port)
             client.set_timeout(20.0)
-            world = client.get_world()
+            if CARLA_FLAT_TEST_SCENE:
+                print("[CARLA] Generating flat test scene from OpenDRIVE")
+                world = load_flat_test_scene_world(client)
+                flat_scene_active = True
+                current_map_name = f"{world.get_map().name} [flat_test_scene]"
+            elif CARLA_MAP_OVERRIDE:
+                try:
+                    configured_map_name = resolve_carla_map_name(client, CARLA_MAP_OVERRIDE)
+                    print(f"[CARLA] Loading map override '{CARLA_MAP_OVERRIDE}' -> {configured_map_name}")
+                    world = client.load_world(configured_map_name)
+                    current_map_name = world.get_map().name
+                except Exception as exc:
+                    print(f"[CARLA] Invalid map override '{CARLA_MAP_OVERRIDE}' ({exc}). Falling back to flat test scene.")
+                    world = load_flat_test_scene_world(client)
+                    flat_scene_active = True
+                    current_map_name = f"{world.get_map().name} [flat_test_scene]"
+            else:
+                print("[CARLA] No map override set. Loading flat test scene.")
+                world = load_flat_test_scene_world(client)
+                flat_scene_active = True
+                current_map_name = f"{world.get_map().name} [flat_test_scene]"
+            print(f"\n{'=' * 60}")
+            print(f"当前CARLA地图: {current_map_name}")
+            print(f"{'=' * 60}\n")
             original_settings = world.get_settings()
             settings = world.get_settings()
             settings.synchronous_mode = True
             settings.fixed_delta_seconds = args.fixed_delta
             world.apply_settings(settings)
 
-            spawn_transform = choose_spawn_transform(world, args.spawn_index)
+            if flat_scene_active:
+                spawn_transform = choose_flat_test_spawn_transform()
+            else:
+                spawn_transform = choose_spawn_transform(world, args.spawn_index)
             actor = spawn_vehicle(world, args.vehicle_filter, spawn_transform)
             actor.set_autopilot(False)
             actor.set_transform(spawn_transform)
@@ -1042,7 +1308,9 @@ def main() -> None:
                     follow_vehicle_with_spectator(world, actor, camera_state=None)
 
         running = True
+        loop_frame_idx = 0
         while running:
+            loop_frame_idx += 1
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -1092,6 +1360,9 @@ def main() -> None:
                     print(f"\n[control] Loading reference {STANDARD_REFERENCE_FILES[reference_idx]}...")
                     if controller.load_standard_reference(reference_dir, reference_idx):
                         paused = False
+
+            if flat_scene_active and world is not None:
+                draw_flat_test_scene_grid(world, get_flat_test_scene_center_location())
 
             if not paused and not controller.is_idle():
                 controller.step_once(world=world)
